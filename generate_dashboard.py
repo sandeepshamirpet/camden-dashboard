@@ -610,8 +610,10 @@ def main():
         f.write(html)
 
     print(f"\nDashboard saved -> {OUT_FILE}")
-    print("   Opening in browser...")
-    webbrowser.open(OUT_FILE)
+    # Only open browser on Windows/Mac (not on Linux CI/cloud servers)
+    if sys.platform != "linux":
+        print("   Opening in browser...")
+        webbrowser.open(OUT_FILE)
 
 
 # ──────────────────────────────────────────────────────────────

@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,9 +34,12 @@ jobs:
         run: python generate_dashboard.py
 
       - name: Commit and push updated dashboard
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/sandeepshamirpet/camden-dashboard.git
           git add sales_management_dashboard_v2.html
           git diff --staged --quiet || git commit -m "Auto-refresh: $(date -u '+%b %d, %Y %H:%M UTC')"
           git push
