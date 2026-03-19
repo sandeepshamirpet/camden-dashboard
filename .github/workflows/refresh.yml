@@ -2,12 +2,11 @@ name: Refresh Dashboard
 
 on:
   schedule:
-    # Runs every 2 hours
-    - cron: '0 */2 * * *'
-  workflow_dispatch:   # Also allows manual trigger from GitHub UI
+    - cron: '0 */2 * * *'   # Every 2 hours
+  workflow_dispatch:          # Manual trigger from GitHub UI
 
 permissions:
-  contents: write   # allows the bot to commit & push the updated HTML
+  contents: write
 
 jobs:
   refresh:
@@ -21,21 +20,25 @@ jobs:
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-        with:
-          python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests
+      - name: Build dashboard generator
+        run: dotnet build SalesDashboard/SalesDashboard.csproj -c Release -o SalesDashboard/out
 
-      - name: Generate dashboard
+      - name: Generate dashboard (Salesforce direct)
         env:
-          TABLEAU_TOKEN_NAME: ${{ secrets.TABLEAU_TOKEN_NAME }}
-          TABLEAU_TOKEN_VALUE: ${{ secrets.TABLEAU_TOKEN_VALUE }}
-        run: python generate_dashboard.py
+          SF_CLIENT_ID:     ${{ secrets.SF_CLIENT_ID }}
+          SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
+          SF_USERNAME:      ${{ secrets.SF_USERNAME }}
+          SF_PASSWORD:      ${{ secrets.SF_PASSWORD }}
+        run: |
+          dotnet SalesDashboard/out/SalesDashboard.dll
+          cp SalesDashboard/out/sales_management_dashboard_v2.html ./sales_management_dashboard_v2.html
 
       - name: Commit and push updated dashboard
         env:
