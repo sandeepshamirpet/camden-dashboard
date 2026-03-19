@@ -11,34 +11,27 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # fix Node.js 20 deprecation
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Set up .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-      - name: Build dashboard generator
-        run: dotnet build SalesDashboard/SalesDashboard.csproj -c Release -o SalesDashboard/out
-
-      - name: Generate dashboard (Salesforce direct)
+      - name: Generate dashboard (build + run in one step)
         env:
           SF_CLIENT_ID:     ${{ secrets.SF_CLIENT_ID }}
           SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
           SF_USERNAME:      ${{ secrets.SF_USERNAME }}
           SF_PASSWORD:      ${{ secrets.SF_PASSWORD }}
-        run: |
-          dotnet SalesDashboard/out/SalesDashboard.dll
-          cp SalesDashboard/out/sales_management_dashboard_v2.html ./sales_management_dashboard_v2.html
+        run: dotnet run --project SalesDashboard/SalesDashboard.csproj --configuration Release
 
       - name: Commit and push updated dashboard
         env:

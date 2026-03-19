@@ -20,8 +20,8 @@ public static class Generator
             .Replace("__DATA_AS_OF__",  data.DataAsOf)
             .Replace("__GENERATED__",   generated);
 
-        string outDir  = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location)!;
-        string outFile = Path.Combine(outDir, "sales_management_dashboard_v2.html");
+        // Use current working directory so output lands in the repo root regardless of run method
+        string outFile = Path.Combine(Directory.GetCurrentDirectory(), "sales_management_dashboard_v2.html");
         File.WriteAllText(outFile, html, System.Text.Encoding.UTF8);
         return outFile;
     }
