@@ -44,14 +44,8 @@ public static class Fetcher
         Console.WriteLine("  Fetching monthly leads by area of interest...");
         var leadsAoi = await FetchLeadsByAoiAsync(http);
 
-        Console.WriteLine("  Fetching appointment counts by day...");
-        var apptsDaily = await FetchApptsDailyAsync(http);
-
-        Console.WriteLine("  Fetching appointments by community...");
-        var apptsAoi = await FetchApptsByAoiAsync(http);
-
-        Console.WriteLine("  Fetching appointments by source...");
-        var apptsSrc = await FetchApptsBySrcAsync(http);
+        Console.WriteLine("  Fetching appointments from Event object...");
+        var (apptsDaily, apptsAoi, apptsSrc) = await FetchApptsAsync(http);
 
         Console.WriteLine("  Fetching all opportunities...");
         var opps = await FetchOppsAsync(http);
@@ -153,106 +147,90 @@ public static class Fetcher
         return result;
     }
 
-    // ── 4a. Daily appointment counts (year by year) ───────────────────────
-    // Field: Appointment_Request_Date_Time__c on Lead object.
-    // Wrapped in try/catch — returns empty list if field doesn't exist in this org.
-    private static async Task<List<DailyCount>> FetchApptsDailyAsync(HttpClient http)
+    // ── 4. Appointments from Event object ────────────────────────────────
+    // Event.StartDateTime = appointment date/time (CST-converted in C#)
+    // Event.Who (polymorphic) → Lead fields: Area_of_Interest__c, LeadSource
+    // Returns three aggregated lists: daily counts, by month+community, by month+source
+    private static async Task<(List<DailyCount> Daily, List<MonthlyAoi> Aoi, List<MonthlySrc> Src)>
+        FetchApptsAsync(HttpClient http)
     {
-        var result = new List<DailyCount>();
+        var daily = new List<DailyCount>();
+        var aoi   = new List<MonthlyAoi>();
+        var src   = new List<MonthlySrc>();
+
         try
         {
-            for (int yr = StartYear; yr <= CurrentYear; yr++)
-            {
-                string soql =
-                    $"SELECT DAY_ONLY(ConvertTimezone(Appointment_Request_Date_Time__c)) d, COUNT(Id) cnt " +
-                    $"FROM Lead " +
-                    $"WHERE IsConverted = false " +
-                    $"AND Appointment_Request_Date_Time__c != null " +
-                    $"AND CALENDAR_YEAR(ConvertTimezone(Appointment_Request_Date_Time__c)) = {yr} " +
-                    $"GROUP BY DAY_ONLY(ConvertTimezone(Appointment_Request_Date_Time__c)) " +
-                    $"ORDER BY DAY_ONLY(ConvertTimezone(Appointment_Request_Date_Time__c)) ASC";
+            // Query all Event records that have a StartDateTime.
+            // TYPEOF Who: when the event is on a Lead, pull Area_of_Interest__c and LeadSource.
+            // When on a Contact, those fields are omitted (null → "Unknown").
+            const string soql =
+                "SELECT StartDateTime, " +
+                "TYPEOF Who WHEN Lead THEN Area_of_Interest__c, LeadSource END " +
+                "FROM Event " +
+                "WHERE StartDateTime != null " +
+                "ORDER BY StartDateTime ASC";
 
-                foreach (var r in await QueryBatchAsync(http, soql))
+            var records = await QueryAllAsync(http, soql);
+            Console.WriteLine($"    → {records.Count} event records fetched");
+
+            // Aggregate in C# — keyed by "yyyy-MM-dd" / "yyyy-MM"
+            var dailyMap = new Dictionary<string, int>();
+            var aoiMap   = new Dictionary<string, Dictionary<string, int>>();  // month → aoi → count
+            var srcMap   = new Dictionary<string, Dictionary<string, int>>();  // month → src → count
+
+            foreach (var r in records)
+            {
+                string rawDt = r.TryGetProperty("StartDateTime", out var dt) ? (dt.GetString() ?? "") : "";
+                string date  = UtcToCstDate(rawDt);
+                if (string.IsNullOrEmpty(date)) continue;
+
+                string month = date[..7]; // "yyyy-MM"
+
+                // Parse Who relationship (Lead fields via TYPEOF)
+                string aoiVal = "Unknown";
+                string srcVal = "Unknown";
+                if (r.TryGetProperty("Who", out var who) && who.ValueKind == JsonValueKind.Object)
                 {
-                    string date = r.TryGetProperty("d",   out var d) ? (d.GetString() ?? "") : "";
-                    int    cnt  = r.TryGetProperty("cnt", out var c) ? c.GetInt32() : 0;
-                    if (!string.IsNullOrEmpty(date)) result.Add(new DailyCount(date, cnt));
+                    if (who.TryGetProperty("Area_of_Interest__c", out var a) &&
+                        a.ValueKind != JsonValueKind.Null)
+                        aoiVal = a.GetString() ?? "Unknown";
+                    if (who.TryGetProperty("LeadSource", out var s) &&
+                        s.ValueKind != JsonValueKind.Null)
+                        srcVal = s.GetString() ?? "Unknown";
                 }
+                if (string.IsNullOrWhiteSpace(aoiVal)) aoiVal = "Unknown";
+                if (string.IsNullOrWhiteSpace(srcVal)) srcVal = "Unknown";
+
+                // Daily count
+                dailyMap[date] = (dailyMap.TryGetValue(date, out int dc) ? dc : 0) + 1;
+
+                // Monthly by AOI
+                if (!aoiMap.ContainsKey(month)) aoiMap[month] = new();
+                aoiMap[month][aoiVal] = (aoiMap[month].TryGetValue(aoiVal, out int ac) ? ac : 0) + 1;
+
+                // Monthly by Source
+                if (!srcMap.ContainsKey(month)) srcMap[month] = new();
+                srcMap[month][srcVal] = (srcMap[month].TryGetValue(srcVal, out int sc) ? sc : 0) + 1;
             }
+
+            // Materialise into flat lists sorted chronologically
+            foreach (var (d, cnt) in dailyMap.OrderBy(x => x.Key))
+                daily.Add(new DailyCount(d, cnt));
+
+            foreach (var (month, entries) in aoiMap.OrderBy(x => x.Key))
+                foreach (var (aoiVal, cnt) in entries)
+                    aoi.Add(new MonthlyAoi(month, aoiVal, cnt));
+
+            foreach (var (month, entries) in srcMap.OrderBy(x => x.Key))
+                foreach (var (srcVal, cnt) in entries)
+                    src.Add(new MonthlySrc(month, srcVal, cnt));
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"  Warning: Appointment daily query failed (field may not exist): {ex.Message.Split('\n')[0]}");
+            Console.WriteLine($"  Warning: Event/Appointment query failed: {ex.Message.Split('\n')[0]}");
         }
-        return result;
-    }
 
-    // ── 4b. Monthly appointments by community (year by year) ─────────────
-    private static async Task<List<MonthlyAoi>> FetchApptsByAoiAsync(HttpClient http)
-    {
-        var result = new List<MonthlyAoi>();
-        try
-        {
-            for (int yr = StartYear; yr <= CurrentYear; yr++)
-            {
-                string soql =
-                    $"SELECT CALENDAR_MONTH(ConvertTimezone(Appointment_Request_Date_Time__c)) mo, " +
-                    $"Area_of_Interest__c aoi, COUNT(Id) cnt " +
-                    $"FROM Lead " +
-                    $"WHERE IsConverted = false " +
-                    $"AND Appointment_Request_Date_Time__c != null " +
-                    $"AND CALENDAR_YEAR(ConvertTimezone(Appointment_Request_Date_Time__c)) = {yr} " +
-                    $"GROUP BY CALENDAR_MONTH(ConvertTimezone(Appointment_Request_Date_Time__c)), Area_of_Interest__c " +
-                    $"ORDER BY CALENDAR_MONTH(ConvertTimezone(Appointment_Request_Date_Time__c)) ASC";
-
-                foreach (var r in await QueryBatchAsync(http, soql))
-                {
-                    int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
-                    string aoi = r.TryGetProperty("aoi", out var a) ? (a.GetString() ?? "Unknown") : "Unknown";
-                    int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
-                    if (mo > 0) result.Add(new MonthlyAoi($"{yr}-{mo:D2}", string.IsNullOrWhiteSpace(aoi) ? "Unknown" : aoi, cnt));
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  Warning: Appointment by community query failed: {ex.Message.Split('\n')[0]}");
-        }
-        return result;
-    }
-
-    // ── 4c. Monthly appointments by lead source (year by year) ───────────
-    private static async Task<List<MonthlySrc>> FetchApptsBySrcAsync(HttpClient http)
-    {
-        var result = new List<MonthlySrc>();
-        try
-        {
-            for (int yr = StartYear; yr <= CurrentYear; yr++)
-            {
-                string soql =
-                    $"SELECT CALENDAR_MONTH(ConvertTimezone(Appointment_Request_Date_Time__c)) mo, " +
-                    $"LeadSource src, COUNT(Id) cnt " +
-                    $"FROM Lead " +
-                    $"WHERE IsConverted = false " +
-                    $"AND Appointment_Request_Date_Time__c != null " +
-                    $"AND CALENDAR_YEAR(ConvertTimezone(Appointment_Request_Date_Time__c)) = {yr} " +
-                    $"GROUP BY CALENDAR_MONTH(ConvertTimezone(Appointment_Request_Date_Time__c)), LeadSource " +
-                    $"ORDER BY CALENDAR_MONTH(ConvertTimezone(Appointment_Request_Date_Time__c)) ASC";
-
-                foreach (var r in await QueryBatchAsync(http, soql))
-                {
-                    int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
-                    string src = r.TryGetProperty("src", out var s) ? (s.GetString() ?? "Unknown") : "Unknown";
-                    int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
-                    if (mo > 0) result.Add(new MonthlySrc($"{yr}-{mo:D2}", string.IsNullOrWhiteSpace(src) ? "Unknown" : src, cnt));
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  Warning: Appointment by source query failed: {ex.Message.Split('\n')[0]}");
-        }
-        return result;
+        return (daily, aoi, src);
     }
 
     // ── 5. All opportunities (raw rows, C# aggregation for flexibility) ────
