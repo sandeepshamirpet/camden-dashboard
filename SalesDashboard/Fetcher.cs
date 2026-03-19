@@ -182,10 +182,11 @@ public static class Fetcher
     // ── Helpers ────────────────────────────────────────────────────────────
     private static string UtcToCstDate(string utcStr)
     {
-        if (!DateTime.TryParse(utcStr, null,
-                System.Globalization.DateTimeStyles.RoundtripKind, out var utc))
+        // DateTimeOffset.TryParse correctly handles Salesforce's "2026-03-18T19:30:00.000+0000"
+        // .UtcDateTime always has DateTimeKind.Utc which ConvertTimeFromUtc requires
+        if (!DateTimeOffset.TryParse(utcStr, out var dto))
             return "";
-        return TimeZoneInfo.ConvertTimeFromUtc(utc, CST).ToString("yyyy-MM-dd");
+        return TimeZoneInfo.ConvertTimeFromUtc(dto.UtcDateTime, CST).ToString("yyyy-MM-dd");
     }
 
     // For aggregate (GROUP BY) queries — single batch only, no queryMore()
