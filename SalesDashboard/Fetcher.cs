@@ -2,21 +2,17 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 
 // ── Data records injected into the HTML dashboard ──────────────────────────
-public record DailyCount(string Date, int Count);
-public record MonthlySrc(string Month, string Src, int Count);
-public record MonthlyAoi(string Month, string Aoi, int Count);
+// Raw per-record rows — JS aggregates these with exact date filtering
+public record LeadRow(string Date, string Src, string Aoi);
+public record ApptRow(string Date, string Aoi, string Src);
 public record OppRow(string Date, string Owner, string Stage, string Comm, string Src);
 
 public class DashboardData
 {
-    public List<DailyCount> LeadsDaily   { get; init; } = new();
-    public List<MonthlySrc> LeadsSrc     { get; init; } = new();
-    public List<MonthlyAoi> LeadsAoi     { get; init; } = new();
-    public List<DailyCount> ApptsDaily   { get; init; } = new();  // appointments by day
-    public List<MonthlyAoi> ApptsAoi     { get; init; } = new();  // appointments by month/community
-    public List<MonthlySrc> ApptsSrc     { get; init; } = new();  // appointments by month/source
-    public List<OppRow>     Opps         { get; init; } = new();
-    public string           DataAsOf     { get; init; } = "";
+    public List<LeadRow> Leads   { get; init; } = new();  // one row per lead
+    public List<ApptRow> Appts   { get; init; } = new();  // one row per appointment (Event)
+    public List<OppRow>  Opps    { get; init; } = new();  // one row per opportunity
+    public string        DataAsOf { get; init; } = "";
 }
 
 // ── Fetcher ────────────────────────────────────────────────────────────────
@@ -35,17 +31,11 @@ public static class Fetcher
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         http.BaseAddress = new Uri(instanceUrl);
 
-        Console.WriteLine("  Fetching daily lead counts...");
-        var leadsDaily = await FetchLeadsDailyAsync(http);
-
-        Console.WriteLine("  Fetching monthly leads by source...");
-        var leadsSrc = await FetchLeadsBySourceAsync(http);
-
-        Console.WriteLine("  Fetching monthly leads by area of interest...");
-        var leadsAoi = await FetchLeadsByAoiAsync(http);
+        Console.WriteLine("  Fetching all lead records (raw, for exact date filtering)...");
+        var leads = await FetchLeadsAsync(http);
 
         Console.WriteLine("  Fetching appointments from Event object...");
-        var (apptsDaily, apptsAoi, apptsSrc) = await FetchApptsAsync(http);
+        var appts = await FetchApptsAsync(http);
 
         Console.WriteLine("  Fetching all opportunities...");
         var opps = await FetchOppsAsync(http);
@@ -55,94 +45,45 @@ public static class Fetcher
 
         return new DashboardData
         {
-            LeadsDaily = leadsDaily,
-            LeadsSrc   = leadsSrc,
-            LeadsAoi   = leadsAoi,
-            ApptsDaily = apptsDaily,
-            ApptsAoi   = apptsAoi,
-            ApptsSrc   = apptsSrc,
-            Opps       = opps,
-            DataAsOf   = dataAsOf
+            Leads    = leads,
+            Appts    = appts,
+            Opps     = opps,
+            DataAsOf = dataAsOf
         };
     }
 
-    // Salesforce aggregate (GROUP BY) queries don't support queryMore() pagination.
-    // Querying year-by-year keeps every batch ≤ 366 rows — well under the 2,000 limit.
-    private static int StartYear => 2019;
-    private static int CurrentYear => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, CST).Year;
-
-    // ── 1. Daily lead counts grouped by CST date (year by year) ───────────
-    private static async Task<List<DailyCount>> FetchLeadsDailyAsync(HttpClient http)
+    // ── 1. All leads — raw records, aggregated in JS for exact date filtering ─
+    // Fetching raw records (not GROUP BY) gives JavaScript exact per-day data
+    // so every date-range filter (last week, last 10 days, etc.) is precise.
+    private static async Task<List<LeadRow>> FetchLeadsAsync(HttpClient http)
     {
-        var result = new List<DailyCount>();
-        for (int yr = StartYear; yr <= CurrentYear; yr++)
+        const string soql =
+            "SELECT CreatedDate, LeadSource, Area_of_Interest__c " +
+            "FROM Lead " +
+            "WHERE IsConverted = false " +
+            "ORDER BY CreatedDate ASC";
+
+        var records = await QueryAllAsync(http, soql);
+        Console.WriteLine($"    → {records.Count} lead records fetched");
+
+        var result = new List<LeadRow>(records.Count);
+        foreach (var r in records)
         {
-            string soql =
-                $"SELECT DAY_ONLY(ConvertTimezone(CreatedDate)) d, COUNT(Id) cnt " +
-                $"FROM Lead " +
-                $"WHERE IsConverted = false " +
-                $"AND CALENDAR_YEAR(ConvertTimezone(CreatedDate)) = {yr} " +
-                $"GROUP BY DAY_ONLY(ConvertTimezone(CreatedDate)) " +
-                $"ORDER BY DAY_ONLY(ConvertTimezone(CreatedDate)) ASC";
+            string rawDt = r.TryGetProperty("CreatedDate", out var dt) ? (dt.GetString() ?? "") : "";
+            string date  = UtcToCstDate(rawDt);
+            if (string.IsNullOrEmpty(date)) continue;
 
-            foreach (var r in await QueryBatchAsync(http, soql))
-            {
-                string date = r.TryGetProperty("d",   out var d) ? (d.GetString() ?? "") : "";
-                int    cnt  = r.TryGetProperty("cnt", out var c) ? c.GetInt32() : 0;
-                if (!string.IsNullOrEmpty(date)) result.Add(new DailyCount(date, cnt));
-            }
-        }
-        return result;
-    }
+            string src = "Unknown";
+            string aoi = "Unknown";
+            if (r.TryGetProperty("LeadSource",         out var s) && s.ValueKind != JsonValueKind.Null)
+                src = s.GetString() ?? "Unknown";
+            if (r.TryGetProperty("Area_of_Interest__c", out var a) && a.ValueKind != JsonValueKind.Null)
+                aoi = a.GetString() ?? "Unknown";
 
-    // ── 2. Monthly leads by lead source (year by year) ────────────────────
-    private static async Task<List<MonthlySrc>> FetchLeadsBySourceAsync(HttpClient http)
-    {
-        var result = new List<MonthlySrc>();
-        for (int yr = StartYear; yr <= CurrentYear; yr++)
-        {
-            string soql =
-                $"SELECT CALENDAR_MONTH(ConvertTimezone(CreatedDate)) mo, " +
-                $"LeadSource src, COUNT(Id) cnt " +
-                $"FROM Lead " +
-                $"WHERE IsConverted = false " +
-                $"AND CALENDAR_YEAR(ConvertTimezone(CreatedDate)) = {yr} " +
-                $"GROUP BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)), LeadSource " +
-                $"ORDER BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)) ASC";
+            if (string.IsNullOrWhiteSpace(src)) src = "Unknown";
+            if (string.IsNullOrWhiteSpace(aoi)) aoi = "Unknown";
 
-            foreach (var r in await QueryBatchAsync(http, soql))
-            {
-                int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
-                string src = r.TryGetProperty("src", out var s) ? (s.GetString() ?? "Unknown") : "Unknown";
-                int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
-                if (mo > 0) result.Add(new MonthlySrc($"{yr}-{mo:D2}", src, cnt));
-            }
-        }
-        return result;
-    }
-
-    // ── 3. Monthly leads by area of interest (year by year) ───────────────
-    private static async Task<List<MonthlyAoi>> FetchLeadsByAoiAsync(HttpClient http)
-    {
-        var result = new List<MonthlyAoi>();
-        for (int yr = StartYear; yr <= CurrentYear; yr++)
-        {
-            string soql =
-                $"SELECT CALENDAR_MONTH(ConvertTimezone(CreatedDate)) mo, " +
-                $"Area_of_Interest__c aoi, COUNT(Id) cnt " +
-                $"FROM Lead " +
-                $"WHERE IsConverted = false " +
-                $"AND CALENDAR_YEAR(ConvertTimezone(CreatedDate)) = {yr} " +
-                $"GROUP BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)), Area_of_Interest__c " +
-                $"ORDER BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)) ASC";
-
-            foreach (var r in await QueryBatchAsync(http, soql))
-            {
-                int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
-                string aoi = r.TryGetProperty("aoi", out var a) ? (a.GetString() ?? "Unknown") : "Unknown";
-                int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
-                if (mo > 0) result.Add(new MonthlyAoi($"{yr}-{mo:D2}", string.IsNullOrWhiteSpace(aoi) ? "Unknown" : aoi, cnt));
-            }
+            result.Add(new LeadRow(date, src, aoi));
         }
         return result;
     }
@@ -151,18 +92,13 @@ public static class Fetcher
     // Event.StartDateTime = appointment date/time (CST-converted in C#)
     // Event.Who (polymorphic) → Lead fields: Area_of_Interest__c, LeadSource
     // Returns three aggregated lists: daily counts, by month+community, by month+source
-    private static async Task<(List<DailyCount> Daily, List<MonthlyAoi> Aoi, List<MonthlySrc> Src)>
-        FetchApptsAsync(HttpClient http)
+    // ── 3. Appointments — raw Event records, aggregated in JS for exact date filtering ─
+    private static async Task<List<ApptRow>> FetchApptsAsync(HttpClient http)
     {
-        var daily = new List<DailyCount>();
-        var aoi   = new List<MonthlyAoi>();
-        var src   = new List<MonthlySrc>();
-
+        var result = new List<ApptRow>();
         try
         {
-            // Query all Event records that have a StartDateTime.
-            // TYPEOF Who: when the event is on a Lead, pull Area_of_Interest__c and LeadSource.
-            // When on a Contact, those fields are omitted (null → "Unknown").
+            // TYPEOF Who: when Event is on a Lead, pull community + source fields.
             const string soql =
                 "SELECT StartDateTime, " +
                 "TYPEOF Who WHEN Lead THEN Area_of_Interest__c, LeadSource END " +
@@ -173,64 +109,32 @@ public static class Fetcher
             var records = await QueryAllAsync(http, soql);
             Console.WriteLine($"    → {records.Count} event records fetched");
 
-            // Aggregate in C# — keyed by "yyyy-MM-dd" / "yyyy-MM"
-            var dailyMap = new Dictionary<string, int>();
-            var aoiMap   = new Dictionary<string, Dictionary<string, int>>();  // month → aoi → count
-            var srcMap   = new Dictionary<string, Dictionary<string, int>>();  // month → src → count
-
             foreach (var r in records)
             {
                 string rawDt = r.TryGetProperty("StartDateTime", out var dt) ? (dt.GetString() ?? "") : "";
                 string date  = UtcToCstDate(rawDt);
                 if (string.IsNullOrEmpty(date)) continue;
 
-                string month = date[..7]; // "yyyy-MM"
-
-                // Parse Who relationship (Lead fields via TYPEOF)
                 string aoiVal = "Unknown";
                 string srcVal = "Unknown";
                 if (r.TryGetProperty("Who", out var who) && who.ValueKind == JsonValueKind.Object)
                 {
-                    if (who.TryGetProperty("Area_of_Interest__c", out var a) &&
-                        a.ValueKind != JsonValueKind.Null)
+                    if (who.TryGetProperty("Area_of_Interest__c", out var a) && a.ValueKind != JsonValueKind.Null)
                         aoiVal = a.GetString() ?? "Unknown";
-                    if (who.TryGetProperty("LeadSource", out var s) &&
-                        s.ValueKind != JsonValueKind.Null)
+                    if (who.TryGetProperty("LeadSource", out var s) && s.ValueKind != JsonValueKind.Null)
                         srcVal = s.GetString() ?? "Unknown";
                 }
                 if (string.IsNullOrWhiteSpace(aoiVal)) aoiVal = "Unknown";
                 if (string.IsNullOrWhiteSpace(srcVal)) srcVal = "Unknown";
 
-                // Daily count
-                dailyMap[date] = (dailyMap.TryGetValue(date, out int dc) ? dc : 0) + 1;
-
-                // Monthly by AOI
-                if (!aoiMap.ContainsKey(month)) aoiMap[month] = new();
-                aoiMap[month][aoiVal] = (aoiMap[month].TryGetValue(aoiVal, out int ac) ? ac : 0) + 1;
-
-                // Monthly by Source
-                if (!srcMap.ContainsKey(month)) srcMap[month] = new();
-                srcMap[month][srcVal] = (srcMap[month].TryGetValue(srcVal, out int sc) ? sc : 0) + 1;
+                result.Add(new ApptRow(date, aoiVal, srcVal));
             }
-
-            // Materialise into flat lists sorted chronologically
-            foreach (var (d, cnt) in dailyMap.OrderBy(x => x.Key))
-                daily.Add(new DailyCount(d, cnt));
-
-            foreach (var (month, entries) in aoiMap.OrderBy(x => x.Key))
-                foreach (var (aoiVal, cnt) in entries)
-                    aoi.Add(new MonthlyAoi(month, aoiVal, cnt));
-
-            foreach (var (month, entries) in srcMap.OrderBy(x => x.Key))
-                foreach (var (srcVal, cnt) in entries)
-                    src.Add(new MonthlySrc(month, srcVal, cnt));
         }
         catch (Exception ex)
         {
             Console.WriteLine($"  Warning: Event/Appointment query failed: {ex.Message.Split('\n')[0]}");
         }
-
-        return (daily, aoi, src);
+        return result;
     }
 
     // ── 5. All opportunities (raw rows, C# aggregation for flexibility) ────

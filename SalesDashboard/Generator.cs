@@ -6,25 +6,17 @@ public static class Generator
 
     public static string Generate(DashboardData data)
     {
-        string leadsDaily   = JsonSerializer.Serialize(data.LeadsDaily,   JSON_OPTS);
-        string leadsSrc     = JsonSerializer.Serialize(data.LeadsSrc,     JSON_OPTS);
-        string leadsAoi     = JsonSerializer.Serialize(data.LeadsAoi,     JSON_OPTS);
-        string apptsDaily   = JsonSerializer.Serialize(data.ApptsDaily,   JSON_OPTS);
-        string apptsAoi     = JsonSerializer.Serialize(data.ApptsAoi,     JSON_OPTS);
-        string apptsSrc     = JsonSerializer.Serialize(data.ApptsSrc,     JSON_OPTS);
-        string opps         = JsonSerializer.Serialize(data.Opps,         JSON_OPTS);
-        string generated    = DateTime.Now.ToString("MMM dd, yyyy HH:mm");
+        string leads     = JsonSerializer.Serialize(data.Leads,   JSON_OPTS);
+        string appts     = JsonSerializer.Serialize(data.Appts,   JSON_OPTS);
+        string opps      = JsonSerializer.Serialize(data.Opps,    JSON_OPTS);
+        string generated = DateTime.Now.ToString("MMM dd, yyyy HH:mm");
 
         string html = Template
-            .Replace("__LEADS_DAILY__", leadsDaily)
-            .Replace("__LEADS_SRC__",   leadsSrc)
-            .Replace("__LEADS_AOI__",   leadsAoi)
-            .Replace("__APPTS_DAILY__", apptsDaily)
-            .Replace("__APPTS_AOI__",   apptsAoi)
-            .Replace("__APPTS_SRC__",   apptsSrc)
-            .Replace("__OPPS__",        opps)
-            .Replace("__DATA_AS_OF__",  data.DataAsOf)
-            .Replace("__GENERATED__",   generated);
+            .Replace("__LEADS__",      leads)
+            .Replace("__APPTS__",      appts)
+            .Replace("__OPPS__",       opps)
+            .Replace("__DATA_AS_OF__", data.DataAsOf)
+            .Replace("__GENERATED__",  generated);
 
         string outFile = Path.Combine(Directory.GetCurrentDirectory(), "sales_management_dashboard_v2.html");
         File.WriteAllText(outFile, html, System.Text.Encoding.UTF8);
@@ -212,13 +204,12 @@ tfoot td:first-child{text-align:left}
 
 <script>
 // ── Injected data ────────────────────────────────────────────────────────────
-const LEADS_DAILY = __LEADS_DAILY__;
-const LEADS_SRC   = __LEADS_SRC__;
-const LEADS_AOI   = __LEADS_AOI__;
-const APPTS_DAILY = __APPTS_DAILY__;
-const APPTS_AOI   = __APPTS_AOI__;
-const APPTS_SRC   = __APPTS_SRC__;
-const OPPS        = __OPPS__;
+// LEADS: [{Date,Src,Aoi}]  — one row per lead, aggregated in JS for exact date ranges
+// APPTS: [{Date,Aoi,Src}]  — one row per appointment event
+// OPPS:  [{Date,Owner,Stage,Comm,Src}]
+const LEADS = __LEADS__;
+const APPTS = __APPTS__;
+const OPPS  = __OPPS__;
 
 // ── Geo coords ───────────────────────────────────────────────────────────────
 const GEO = {
@@ -340,8 +331,7 @@ function getRange(r) {
     const thisMon = new Date(t); thisMon.setDate(t.getDate()-dsm); thisMon.setHours(0,0,0,0);
     const lastSun = new Date(thisMon); lastSun.setDate(thisMon.getDate()-1); lastSun.setHours(23,59,59,999);
     const lastMon = new Date(lastSun); lastMon.setDate(lastSun.getDate()-6); lastMon.setHours(0,0,0,0);
-    const ms = new Set([ym(lastMon)]); if (ym(lastMon)!==ym(lastSun)) ms.add(ym(lastSun));
-    return {start:lastMon,end:lastSun,months:ms};
+    return {start:lastMon,end:lastSun};
   } else if (r==='last-10') { s=new Date(t); s.setDate(t.getDate()-9);
   } else if (r==='last-20') { s=new Date(t); s.setDate(t.getDate()-19);
   } else if (r==='last-30') { s=new Date(t); s.setDate(t.getDate()-29);
@@ -353,9 +343,7 @@ function getRange(r) {
     t=new Date(t.getFullYear()-1,11,31,23,59,59,999);
   }
   s.setHours(0,0,0,0);
-  const ms=new Set(), cur=new Date(s.getFullYear(),s.getMonth(),1), last=new Date(t.getFullYear(),t.getMonth(),1);
-  while (cur<=last){ ms.add(ym(cur)); cur.setMonth(cur.getMonth()+1); }
-  return {start:s,end:t,months:ms};
+  return {start:s,end:t};
 }
 
 // ── Funnel table builder ──────────────────────────────────────────────────────
@@ -398,37 +386,38 @@ function buildTable(tbodyId, tfootId, rows, totLeads, totAppts, totOpps, totCanc
 
 // ── Main update ───────────────────────────────────────────────────────────────
 function update(r) {
-  const {start,end,months} = getRange(r);
+  const {start,end} = getRange(r);
 
-  // ── KPI: exact counts from daily data ──────────────────────────────────
+  // Exact date check — all aggregation uses this, matching Salesforce's date filters
   const inRange = d => { const dt=new Date(d+'T00:00:00'); return dt>=start&&dt<=end; };
 
-  const totalLeads = LEADS_DAILY.filter(d=>inRange(d.Date)).reduce((s,d)=>s+d.Count,0);
-  const totalAppts = APPTS_DAILY.filter(d=>inRange(d.Date)).reduce((s,d)=>s+d.Count,0);
-  const hasAppts   = APPTS_DAILY.length > 0;
+  // ── Aggregate LEADS from raw records ───────────────────────────────────
+  const leadsAoiMap = {}, leadsSrcMap = {};
+  let totalLeads = 0;
+  for (const d of LEADS) {
+    if (!inRange(d.Date)) continue;
+    totalLeads++;
+    leadsAoiMap[d.Aoi] = (leadsAoiMap[d.Aoi]||0)+1;
+    leadsSrcMap[d.Src] = (leadsSrcMap[d.Src]||0)+1;
+  }
 
+  // ── Aggregate APPTS from raw records ───────────────────────────────────
+  const apptsAoiMap = {}, apptsSrcMap = {};
+  let totalAppts = 0;
+  const hasAppts = APPTS.length > 0;
+  for (const d of APPTS) {
+    if (!inRange(d.Date)) continue;
+    totalAppts++;
+    apptsAoiMap[d.Aoi] = (apptsAoiMap[d.Aoi]||0)+1;
+    apptsSrcMap[d.Src] = (apptsSrcMap[d.Src]||0)+1;
+  }
+
+  // ── Opportunities (already raw records) ────────────────────────────────
   const fOpps = OPPS.filter(d=>inRange(d.Date));
   const totalOpps = fOpps.length;
   const fCanc     = fOpps.filter(d=>d.Stage==='Closed Lost'||d.Stage==='Cancelled');
   const totalCanc = fCanc.length;
   const totalNet  = totalOpps - totalCanc;
-
-  // ── Monthly breakdowns (community & source) ────────────────────────────
-  const leadsAoiMap  = {};
-  for (const d of LEADS_AOI.filter(d=>months.has(d.Month)))
-    leadsAoiMap[d.Aoi] = (leadsAoiMap[d.Aoi]||0)+d.Count;
-
-  const apptsAoiMap = {};
-  for (const d of APPTS_AOI.filter(d=>months.has(d.Month)))
-    apptsAoiMap[d.Aoi] = (apptsAoiMap[d.Aoi]||0)+d.Count;
-
-  const leadsSrcMap = {};
-  for (const d of LEADS_SRC.filter(d=>months.has(d.Month)))
-    leadsSrcMap[d.Src] = (leadsSrcMap[d.Src]||0)+d.Count;
-
-  const apptsSrcMap = {};
-  for (const d of APPTS_SRC.filter(d=>months.has(d.Month)))
-    apptsSrcMap[d.Src] = (apptsSrcMap[d.Src]||0)+d.Count;
 
   // Opps & Cancellations by community and source (exact date range)
   const oppsCommMap={}, cancCommMap={}, oppsSrcMap={}, cancSrcMap={};
