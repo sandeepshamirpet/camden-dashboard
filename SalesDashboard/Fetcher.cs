@@ -57,10 +57,11 @@ public static class Fetcher
     // so every date-range filter (last week, last 10 days, etc.) is precise.
     private static async Task<List<LeadRow>> FetchLeadsAsync(HttpClient http)
     {
+        // No IsConverted filter — matches Salesforce standard "Leads Created" reports
+        // which count all leads regardless of whether they were later converted.
         const string soql =
             "SELECT CreatedDate, LeadSource, Area_of_Interest__c " +
             "FROM Lead " +
-            "WHERE IsConverted = false " +
             "ORDER BY CreatedDate ASC";
 
         var records = await QueryAllAsync(http, soql);
