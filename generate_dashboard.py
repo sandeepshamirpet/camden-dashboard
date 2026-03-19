@@ -1,0 +1,1663 @@
+#!/usr/bin/env python
+"""
+Camden Homes – Sales Management Dashboard Generator
+====================================================
+Queries Tableau Online (no browser login needed) and generates a
+self-contained HTML dashboard with Chart.js + Leaflet map.
+
+Setup:
+  pip install requests
+
+Usage (with live data):
+  set TABLEAU_TOKEN_NAME=your_token_name
+  set TABLEAU_TOKEN_VALUE=your_token_secret
+  python generate_dashboard.py
+
+  → Opens sales_management_dashboard_v2.html in your browser
+"""
+
+import csv, io, json, os, sys, webbrowser
+from datetime import date, timedelta, datetime
+from collections import defaultdict
+
+try:
+    import requests
+except ImportError:
+    sys.exit("ERROR: pip install requests")
+
+# ──────────────────────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────────────────────
+SERVER      = "https://us-east-1.online.tableau.com"
+SITE        = "camdenhomes"
+API_VER     = "3.22"
+TOKEN_NAME  = os.environ.get("TABLEAU_TOKEN_NAME",  "")
+TOKEN_VALUE = os.environ.get("TABLEAU_TOKEN_VALUE", "")
+OUT_FILE    = os.path.join(os.path.dirname(__file__), "sales_management_dashboard_v2.html")
+
+# View IDs inside "New Version Leads vs Opportunities"
+VIEW_LEADS_SRC  = "4b880073-56d6-4d93-b4b7-f4ea0870431d"   # Leads vs Sources
+VIEW_OPP_TILE   = "c58cb4cb-6036-4bbf-a7d9-7cd110e5d8a3"   # Opportunities Tile (Closed Won)
+VIEW_CW         = "3dbdb6eb-0fd8-4953-8f84-f8dc23074421"   # CW Opps vs Lead Sources
+VIEW_CANCEL     = "6f5db20f-266c-43d8-9c99-6f1cac342f38"   # Cancellations (Closed Lost)
+VIEW_OPPS_ALL   = "273dcb6a-fa62-4453-adcb-fe1f70614ac4"   # All Opportunities (for owner name)
+VIEW_ATL        = "38a21e05-ebf6-4e10-9563-a6d71ebc65e6"   # All Time Leads (daily granularity)
+
+# Community geo-coordinates (Texas / Oklahoma)
+GEO = {
+    "Anna":        (33.3526, -96.5472), "Blue Ridge":  (33.2751, -96.4064),
+    "Boyd":        (33.0748, -97.5642), "Brownsboro":  (32.2960, -95.6208),
+    "Celina":      (33.3237, -96.7853), "Cleveland":   (30.3435, -95.0869),
+    "Crowley":     (32.5796, -97.3628), "Dallas":      (32.7767, -96.7970),
+    "Dallas-West": (32.7550, -97.0500), "Decatur":     (33.2348, -97.5836),
+    "Denton":      (33.2148, -97.1331), "Durant":      (33.9940, -96.3753),
+    "Farmersville":(33.1648, -96.3600), "Fort Worth":  (32.7555, -97.3308),
+    "Houston":     (29.7604, -95.3698), "Mabank":      (32.3671, -96.1044),
+    "Mesquite":    (32.7668, -96.5992), "Princeton":   (33.1793, -96.4983),
+    "Red Oak":     (32.5157, -96.8044), "Royse City":  (32.9751, -96.3311),
+    "Sherman":     (33.6357, -96.6089), "Terrell":     (32.7360, -96.2752),
+    "Tyler":       (32.3513, -95.3011), "Waxahachie":  (32.3868, -96.8489),
+}
+
+# ──────────────────────────────────────────────────────────────
+# TABLEAU REST API
+# ──────────────────────────────────────────────────────────────
+def signin():
+    r = requests.post(
+        f"{SERVER}/api/{API_VER}/auth/signin",
+        json={"credentials": {"personalAccessTokenName": TOKEN_NAME,
+                              "personalAccessTokenSecret": TOKEN_VALUE,
+                              "site": {"contentUrl": SITE}}},
+        headers={"Accept": "application/json"}, timeout=30
+    )
+    r.raise_for_status()
+    c = r.json()["credentials"]
+    return c["token"], c["site"]["id"]
+
+def signout(tok):
+    requests.post(f"{SERVER}/api/{API_VER}/auth/signout",
+                  headers={"x-tableau-auth": tok}, timeout=10)
+
+def view_csv(tok, site_id, view_id):
+    r = requests.get(
+        f"{SERVER}/api/{API_VER}/sites/{site_id}/views/{view_id}/data",
+        headers={"x-tableau-auth": tok},
+        params={"vf_includeAllColumns": "true"},
+        timeout=120
+    )
+    r.raise_for_status()
+    return r.text
+
+def get_view_updated_at(tok, site_id, view_id):
+    """Return the last-updated timestamp of a view as a CST string, e.g. 'Mar 18, 2026 8:24 PM CST'."""
+    try:
+        r = requests.get(
+            f"{SERVER}/api/{API_VER}/sites/{site_id}/views/{view_id}",
+            headers={"x-tableau-auth": tok, "Accept": "application/json"},
+            timeout=30
+        )
+        r.raise_for_status()
+        updated_at = r.json().get("view", {}).get("updatedAt", "")
+        if updated_at:
+            # Tableau returns UTC ISO 8601, e.g. "2026-03-19T02:24:52Z"
+            dt_utc = datetime.strptime(updated_at, "%Y-%m-%dT%H:%M:%SZ")
+            dt_cst = dt_utc + timedelta(hours=-6)
+            # Use %#I on Windows to suppress zero-padding; fall back if unsupported
+            try:
+                return dt_cst.strftime("%b %d, %Y %#I:%M %p CST")
+            except ValueError:
+                return dt_cst.strftime("%b %d, %Y %I:%M %p CST")
+    except Exception as e:
+        print(f"   Warning: could not fetch view updated time: {e}")
+    return "unknown"
+
+# ──────────────────────────────────────────────────────────────
+# PARSE HELPERS
+# ──────────────────────────────────────────────────────────────
+def parse_csv(text):
+    reader = csv.DictReader(io.StringIO(text.strip()))
+    return [row for row in reader]
+
+def safe_int(v):
+    try: return int(str(v).replace(",","").strip())
+    except: return 0
+
+def parse_month(s):
+    """'January 2026' → date(2026,1,1)"""
+    for fmt in ("%B %Y", "%b %Y"):
+        try: return datetime.strptime(s.strip(), fmt).date()
+        except: pass
+    return None
+
+def parse_day(s):
+    """'February 5, 2026' → date(2026,2,5)"""
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(s.strip(), fmt).date()
+            return d
+        except: pass
+    return None
+
+# ──────────────────────────────────────────────────────────────
+# FETCH & AGGREGATE DATA
+# ──────────────────────────────────────────────────────────────
+def fetch_all(tok, site_id):
+    print("  Fetching Leads by Source...")
+    leads_raw  = parse_csv(view_csv(tok, site_id, VIEW_LEADS_SRC))
+    print("  Fetching All Time Leads (daily)...")
+    atl_raw    = parse_csv(view_csv(tok, site_id, VIEW_ATL))
+    print("  Fetching All Opportunities (day-level)...")
+    opp_raw    = parse_csv(view_csv(tok, site_id, VIEW_OPPS_ALL))
+    return leads_raw, atl_raw, opp_raw
+
+
+def aggregate(leads_raw, atl_raw=None, opp_raw=None):
+    """
+    Returns dicts keyed by ISO month string ('2026-01') for easy JS filtering.
+    """
+    # ── LEADS ──────────────────────────────────────────────────
+    # Fields: Area_of_Interest__c (Lead) | LeadSource (Lead) | Month, Year … | Count of Lead
+    leads = []
+    for r in leads_raw:
+        area   = r.get("Area_of_Interest__c (Lead)", "").strip()
+        source = r.get("LeadSource (Lead)", "").strip()
+        mon    = r.get("Month, Year of CreatedDate (Lead)", "").strip()
+        cnt    = safe_int(r.get("Count of Lead", 0))
+        if not cnt: continue
+        d = parse_month(mon)
+        if d:
+            leads.append({"area": area or "Unknown", "source": source or "Unknown",
+                          "month": d.strftime("%Y-%m"), "count": cnt})
+
+    # ── CLOSED WON / LOST / OPPS / OWNER (day-level from All Opportunities view) ─
+    # Each row in opp_raw is one opportunity with Day of Created Date + Stage + City + Owner
+    cw         = []
+    lost       = []
+    opps_owner = []
+    opps       = []  # all stages (Opps Created)
+
+    if opp_raw:
+        cw_agg    = defaultdict(int)   # (date, city)
+        lost_agg  = defaultdict(int)
+        opps_agg  = defaultdict(int)   # (date, city) all stages
+        owner_agg = defaultdict(int)   # (date, owner)
+        for r in opp_raw:
+            stage   = r.get("Stage", "").strip()
+            city    = r.get("City__c (Homes)", "").strip() or "Unknown"
+            owner   = r.get("Name (User)", "").strip()
+            created = r.get("Day of Created Date", "").strip()
+            # Only skip rows with no Created Date — Stage is NOT required for total count
+            # (Records with no date at all are non-opportunity property records)
+            if not created: continue
+            d = parse_day(created)
+            if not d: continue
+            ds = d.strftime("%Y-%m-%d")
+            opps_agg[(ds, city)] += 1
+            if owner:
+                owner_agg[(ds, owner)] += 1
+            # Stage needed only for Closed Won / Closed Lost categorization
+            if stage == "Closed Won":
+                cw_agg[(ds, city)] += 1
+            elif stage == "Closed Lost":
+                lost_agg[(ds, city)] += 1
+        cw         = [{"date": k[0], "city": k[1], "count": v} for k, v in cw_agg.items()]
+        lost       = [{"date": k[0], "city": k[1], "count": v} for k, v in lost_agg.items()]
+        opps       = [{"date": k[0], "city": k[1], "count": v} for k, v in opps_agg.items()]
+        opps_owner = [{"date": k[0], "owner": k[1], "count": v} for k, v in owner_agg.items()]
+
+    # ── LEADS DAILY (from All Time Leads view) ─────────────────
+    # VIEW_ATL stores "Day of CreatedDate (Lead)" as the UTC calendar date.
+    # CST = UTC-6, so leads created after 6 PM CST appear as "next day" in UTC.
+    # We keep the raw UTC date strings here and compensate in JavaScript by
+    # extending the filter window +6 hours on the end side.
+    leads_daily = []
+    leads_daily_src = []   # per date+source for source chart
+    if atl_raw:
+        daily_map = {}
+        cnt_key = next((k for k in (atl_raw[0] if atl_raw else {})
+                        if "count" in k.lower() or "distinct" in k.lower()), "Count of Lead")
+        for r in atl_raw:
+            day_str = r.get("Day of CreatedDate (Lead)", "").strip()
+            cnt_str = r.get(cnt_key, "0").replace(",", "")
+            d = parse_day(day_str)
+            if not d: continue
+            ds = d.strftime("%Y-%m-%d")   # keep as UTC date; JS handles CST offset
+            cnt = safe_int(cnt_str)
+            daily_map[ds] = cnt   # daily total repeated per row; idempotent
+        leads_daily = [{"date": ds, "count": cnt} for ds, cnt in sorted(daily_map.items())]
+        leads_daily_src = []   # per-source daily data not used in dashboard; omit to keep file small
+
+    return leads, cw, lost, opps_owner, opps, leads_daily, leads_daily_src
+
+
+# ──────────────────────────────────────────────────────────────
+# GENERATE HTML
+# ──────────────────────────────────────────────────────────────
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Sales Management Dashboard – Camden Homes</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh}
+/* Header */
+.hdr{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 60%,#0f3460 100%);color:#fff;padding:18px 30px;display:flex;align-items:center;justify-content:space-between;box-shadow:0 2px 12px rgba(0,0,0,.35)}
+.hdr h1{font-size:1.55rem;font-weight:700}.hdr p{font-size:.82rem;color:#a0aec0;margin-top:3px}
+.hdr-brand{font-size:1.1rem;font-weight:700;color:#63b3ed}
+/* Filter bar */
+.fbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:12px 30px;display:flex;align-items:center;gap:24px;flex-wrap:wrap;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.fbar label{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#4a5568}
+.btn-grp{display:flex;gap:7px;flex-wrap:wrap}
+.dbtn{padding:6px 14px;border:1.5px solid #cbd5e0;border-radius:18px;background:#f7fafc;color:#4a5568;font-size:.82rem;font-weight:500;cursor:pointer;transition:all .15s;white-space:nowrap}
+.dbtn:hover{border-color:#4299e1;color:#2b6cb0;background:#ebf8ff}
+.dbtn.active{background:#2b6cb0;border-color:#2b6cb0;color:#fff;box-shadow:0 2px 8px rgba(43,108,176,.3)}
+.finfo{margin-left:auto;font-size:.78rem;color:#718096}
+#range-lbl{font-weight:700;color:#2b6cb0}
+/* KPIs */
+.kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;padding:18px 30px 6px}
+@media(max-width:900px){.kpi-row{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:#fff;border-radius:10px;padding:18px 20px;box-shadow:0 1px 6px rgba(0,0,0,.07);display:flex;flex-direction:column;gap:5px;border-top:4px solid transparent;transition:transform .15s}
+.kpi:hover{transform:translateY(-2px);box-shadow:0 4px 14px rgba(0,0,0,.11)}
+.kpi.leads{border-color:#3182ce}.kpi.opps{border-color:#805ad5}
+.kpi.won{border-color:#38a169}.kpi.lost{border-color:#e53e3e}
+.kpi-lbl{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:#718096}
+.kpi-val{font-size:2.1rem;font-weight:800;line-height:1}
+.kpi.leads .kpi-val{color:#2b6cb0}.kpi.opps .kpi-val{color:#6b46c1}
+.kpi.won   .kpi-val{color:#276749}.kpi.lost .kpi-val{color:#c53030}
+.kpi-sub{font-size:.75rem;color:#a0aec0}
+/* Grid */
+.grid{display:grid;grid-template-columns:55% 45%;gap:15px;padding:6px 30px 22px}
+.grid .full{grid-column:1/-1}
+@media(max-width:1100px){.grid{grid-template-columns:1fr}}
+.panel{background:#fff;border-radius:10px;box-shadow:0 1px 6px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column}
+.ph{padding:12px 16px 8px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between}
+.ph h2{font-size:.92rem;font-weight:700;color:#2d3748}
+.badge{font-size:.7rem;font-weight:600;background:#ebf8ff;color:#2b6cb0;padding:2px 8px;border-radius:10px}
+#map{height:420px;width:100%}
+.chart-wrap{padding:14px 16px;flex:1}
+canvas{max-height:370px}
+.footer{text-align:center;padding:10px;font-size:.72rem;color:#a0aec0;background:#f7fafc;border-top:1px solid #e2e8f0}
+</style>
+</head>
+<body>
+
+<header class="hdr">
+  <div><h1>Sales Management Dashboard</h1><p>Leads · Opportunities · Closed Won · Closed Lost</p></div>
+  <div class="hdr-brand">Camden Homes</div>
+</header>
+
+<div class="fbar">
+  <label>Date Range</label>
+  <div class="btn-grp">
+    <button class="dbtn" data-r="last-month">Last Month</button>
+    <button class="dbtn" data-r="cur-month">Current Month</button>
+    <button class="dbtn" data-r="last-week">Last Week</button>
+    <button class="dbtn" data-r="last-10">Last 10 Days</button>
+    <button class="dbtn" data-r="last-20">Last 20 Days</button>
+    <button class="dbtn" data-r="last-30">Last 30 Days</button>
+    <button class="dbtn" data-r="last-60">Last 60 Days</button>
+    <button class="dbtn" data-r="last-90">Last 90 Days</button>
+    <button class="dbtn" data-r="ytd">YTD</button>
+    <button class="dbtn" data-r="last-year">Last Year</button>
+  </div>
+  <div class="finfo">Showing: <span id="range-lbl">Last Month</span> &nbsp;|&nbsp; <span id="range-dates"></span></div>
+</div>
+
+<div class="kpi-row">
+  <div class="kpi leads"><div class="kpi-lbl">Leads Created</div><div class="kpi-val" id="k-leads">0</div><div class="kpi-sub" id="k-leads-s">—</div></div>
+  <div class="kpi opps"><div class="kpi-lbl">Opportunities Created</div><div class="kpi-val" id="k-opps">0</div><div class="kpi-sub" id="k-opps-s">—</div></div>
+  <div class="kpi won"><div class="kpi-lbl">Closed Won</div><div class="kpi-val" id="k-won">0</div><div class="kpi-sub" id="k-won-s">—</div></div>
+  <div class="kpi lost"><div class="kpi-lbl">Closed Lost</div><div class="kpi-val" id="k-lost">0</div><div class="kpi-sub" id="k-lost-s">—</div></div>
+</div>
+
+<div class="grid">
+  <!-- Map -->
+  <div class="panel">
+    <div class="ph"><h2>🗺️ Leads by Community (Area of Interest)</h2><span class="badge">Geo Map</span></div>
+    <div id="map"></div>
+  </div>
+  <!-- Lead Source -->
+  <div class="panel">
+    <div class="ph"><h2>📊 Leads by Source</h2><span class="badge">Lead Source</span></div>
+    <div class="chart-wrap"><canvas id="ch-source"></canvas></div>
+  </div>
+  <!-- Opportunities bar (full width) -->
+  <div class="panel full">
+    <div class="ph"><h2>📈 Opportunities Created by Owner</h2><span class="badge">Opportunities</span></div>
+    <div class="chart-wrap"><canvas id="ch-opps"></canvas></div>
+  </div>
+  <!-- Closed Won -->
+  <div class="panel">
+    <div class="ph"><h2>✅ Closed Won by Community</h2><span class="badge">Won</span></div>
+    <div class="chart-wrap"><canvas id="ch-won"></canvas></div>
+  </div>
+  <!-- Closed Lost -->
+  <div class="panel">
+    <div class="ph"><h2>❌ Closed Lost / Cancellations by Source</h2><span class="badge">Lost</span></div>
+    <div class="chart-wrap"><canvas id="ch-lost"></canvas></div>
+  </div>
+</div>
+
+<div class="footer">Data source: Salesforce via Tableau Online (Camden Homes) &nbsp;·&nbsp; <strong>Data as of: __DATA_AS_OF__</strong> &nbsp;·&nbsp; Dashboard generated: __GENERATED__</div>
+
+<script>
+// ─── Data injected by Python ───────────────────────────────────────────
+const LEADS      = __LEADS__;
+const LEADS_DAILY = __LEADS_DAILY__;
+const LEADS_DAILY_SRC = __LEADS_DAILY_SRC__;
+const CW         = __CW__;
+const LOST       = __LOST__;
+const OPPS       = __OPPS__;
+const OPPS_OWNER = __OPPS_OWNER__;
+const GEO        = __GEO__;
+
+// ─── Date helpers ──────────────────────────────────────────────────────
+const TODAY = new Date();
+function ym(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); }
+function fmtDate(d){ return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }
+function lastDayOfMonth(y,m){ return new Date(y,m,0); }
+
+function getRange(r){
+  let t = new Date(); t.setHours(23,59,59,999);
+  let s = new Date();
+  if(r==='last-month'){
+    s=new Date(t.getFullYear(),t.getMonth()-1,1);
+    const e=new Date(t.getFullYear(),t.getMonth(),0,23,59,59);
+    return{start:s,end:e,months:new Set([ym(s)])};
+  }
+  if(r==='last-week'){
+    // Fiscal week: Monday–Sunday
+    const dow=t.getDay(); // 0=Sun,1=Mon,...,6=Sat
+    const daysSinceMon=dow===0?6:dow-1;
+    const thisMon=new Date(t); thisMon.setDate(t.getDate()-daysSinceMon); thisMon.setHours(0,0,0,0);
+    const lastSun=new Date(thisMon); lastSun.setDate(thisMon.getDate()-1); lastSun.setHours(23,59,59,999);
+    const lastMon=new Date(lastSun); lastMon.setDate(lastSun.getDate()-6); lastMon.setHours(0,0,0,0);
+    const ms=new Set([ym(lastMon)]); if(ym(lastMon)!==ym(lastSun)) ms.add(ym(lastSun));
+    return{start:lastMon,end:lastSun,months:ms};
+  }
+  if(r==='cur-month'){s=new Date(t.getFullYear(),t.getMonth(),1);}
+  if(r==='last-10') {s=new Date(t); s.setDate(s.getDate()-10);}
+  if(r==='last-20') {s=new Date(t); s.setDate(s.getDate()-20);}
+  if(r==='last-30') {s=new Date(t); s.setDate(s.getDate()-30);}
+  if(r==='last-60') {s=new Date(t); s.setDate(s.getDate()-60);}
+  if(r==='last-90') {s=new Date(t); s.setDate(s.getDate()-90);}
+  if(r==='ytd')     {s=new Date(t.getFullYear(),0,1);}
+  if(r==='last-year'){s=new Date(t.getFullYear()-1,0,1); t=new Date(t.getFullYear()-1,11,31,23,59,59,999);}
+  s.setHours(0,0,0,0);
+  // collect month keys
+  const months=new Set(); let cur=new Date(s);
+  while(cur<=t){months.add(ym(cur));cur.setMonth(cur.getMonth()+1);}
+  return{start:s,end:t,months};
+}
+
+// ─── Filter helpers ────────────────────────────────────────────────────
+function filterByMonths(arr,months){ return arr.filter(d=>months.has(d.month)); }
+function filterByDateRange(arr,start,end){
+  return arr.filter(d=>{
+    const dt=new Date(d.date+'T00:00:00');
+    return dt>=start && dt<=end;
+  });
+}
+
+function sumBy(arr,key){
+  const m={};
+  arr.forEach(d=>{m[d[key]]=(m[d[key]]||0)+d.count;});
+  return m;
+}
+function topN(obj,n=15){
+  return Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n);
+}
+
+// ─── Charts ────────────────────────────────────────────────────────────
+const PALETTE = [
+  '#3182ce','#38a169','#dd6b20','#805ad5','#e53e3e',
+  '#00b5d8','#d69e2e','#718096','#b83280','#2f855a',
+  '#c05621','#553c9a','#9b2335','#285e61','#744210'
+];
+
+let chartSource, chartOpps, chartWon, chartLost;
+
+function buildBar(canvasId, labels, data, colors, title, existing){
+  if(existing){ existing.data.labels=labels; existing.data.datasets[0].data=data; existing.data.datasets[0].backgroundColor=colors; existing.update(); return existing; }
+  return new Chart(document.getElementById(canvasId),{
+    type:'bar',
+    data:{labels,datasets:[{data,backgroundColor:colors,borderRadius:5,borderSkipped:false}]},
+    options:{
+      indexAxis:'y', responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false},title:{display:false},tooltip:{callbacks:{label:ctx=>' '+ctx.raw+' '+title}}},
+      scales:{x:{grid:{color:'#f0f0f0'},ticks:{font:{size:11}}},y:{ticks:{font:{size:11}}}}
+    }
+  });
+}
+
+function buildHBar(canvasId, labels, data, colors, title, existing){
+  if(existing){ existing.data.labels=labels; existing.data.datasets[0].data=data; existing.data.datasets[0].backgroundColor=colors; existing.update(); return existing; }
+  return new Chart(document.getElementById(canvasId),{
+    type:'bar',
+    data:{labels,datasets:[{data,backgroundColor:colors,borderRadius:5}]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+ctx.raw+' '+title}}},
+      scales:{x:{grid:{color:'#f0f0f0'}},y:{ticks:{font:{size:11}}}}
+    }
+  });
+}
+
+// ─── Leaflet Map ───────────────────────────────────────────────────────
+const map = L.map('map',{zoomControl:true}).setView([32.5,-97.0],7);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+  {attribution:'© CartoDB',maxZoom:18}).addTo(map);
+let markers=[];
+
+function updateMap(leadsFiltered){
+  markers.forEach(m=>m.remove()); markers=[];
+  const byArea = sumBy(leadsFiltered,'area');
+  const maxVal = Math.max(...Object.values(byArea),1);
+  Object.entries(byArea).forEach(([area,cnt])=>{
+    const g=GEO[area]; if(!g) return;
+    const r=8+Math.sqrt(cnt/maxVal)*30;
+    const m=L.circleMarker([g[0],g[1]],{
+      radius:r,fillColor:'#3182ce',color:'#1a4c7e',
+      weight:1.5,opacity:1,fillOpacity:0.65
+    }).bindPopup(`<b>${area}</b><br>${cnt} lead${cnt===1?'':'s'}`)
+     .addTo(map);
+    markers.push(m);
+  });
+}
+
+// ─── Main update ───────────────────────────────────────────────────────
+function update(rangeKey, label){
+  const {start,end,months} = getRange(rangeKey);
+  document.getElementById('range-lbl').textContent = label;
+  document.getElementById('range-dates').textContent = fmtDate(start)+' → '+fmtDate(end);
+
+  const fLeads     = filterByMonths(LEADS,      months);   // monthly data
+  const fCW        = filterByDateRange(CW,         start, end);
+  const fLost      = filterByDateRange(LOST,        start, end);
+  const fOpps      = filterByDateRange(OPPS,        start, end);
+  const fOppsOwner = filterByDateRange(OPPS_OWNER,  start, end);
+
+  // KPIs
+  // Leads: use LEADS_DAILY for exact daily counts when available.
+  // VIEW_ATL dates are in UTC. CST = UTC-6, so a lead created at 7 PM CST
+  // appears as "next day" in UTC. We extend the end by 6 h to capture those
+  // same-CST-day leads that Tableau tags with the next UTC date.
+  const endUtcAdj = new Date(end.getTime() + 6*60*60*1000);
+  let totalLeads;
+  const fLeadsDaily = (LEADS_DAILY||[]).filter(d=>{
+    const dt = new Date(d.date+'T00:00:00');
+    return dt>=start && dt<=endUtcAdj;
+  });
+  if(fLeadsDaily.length > 0){
+    totalLeads = fLeadsDaily.reduce((s,d)=>s+d.count,0);
+  } else {
+    totalLeads = fLeads.reduce((s,d)=>s+d.count,0);
+  }
+  const totalOpps  = fOpps.reduce((s,d)=>s+d.count,0);
+  const totalWon   = fCW.reduce((s,d)=>s+d.count,0);
+  const totalLost  = fLost.reduce((s,d)=>s+d.count,0);
+  const sub = `${fmtDate(start)} – ${fmtDate(end)}`;
+  document.getElementById('k-leads').textContent = totalLeads.toLocaleString();
+  document.getElementById('k-opps') .textContent = totalOpps .toLocaleString();
+  document.getElementById('k-won')  .textContent = totalWon  .toLocaleString();
+  document.getElementById('k-lost') .textContent = totalLost .toLocaleString();
+  ['k-leads-s','k-opps-s','k-won-s','k-lost-s'].forEach(id=>document.getElementById(id).textContent=sub);
+  // Proportional fallback for map & source chart when no monthly LEADS data exists for this period
+  const _allLeadsTotal = LEADS.reduce((s,d)=>s+d.count,0);
+  const fLeadsForCharts = (fLeads.length > 0 || totalLeads === 0) ? fLeads
+    : LEADS.map(d=>({...d, count: Math.round(d.count * (totalLeads / (_allLeadsTotal||1)))}));
+
+
+  // Map
+  updateMap(fLeadsForCharts);
+
+  // Lead Source chart (top 12)
+  // Proportional scaling: scale monthly source breakdown by (exact daily range leads / full month leads)
+  // This ensures different filters show different source values while preserving relative proportions
+  const monthlyTotal = fLeadsForCharts.reduce((s,d)=>s+d.count,0);
+  const ratio = monthlyTotal > 0 ? totalLeads / monthlyTotal : 1;
+  const rawSrcMap = sumBy(fLeadsForCharts,'source');
+  const srcMap = {};
+  for(const[k,v] of Object.entries(rawSrcMap)) srcMap[k] = Math.round(v*ratio);
+  const srcTop = topN(srcMap,12);
+  chartSource = buildBar('ch-source',srcTop.map(x=>x[0]),srcTop.map(x=>x[1]),PALETTE,'leads',chartSource);
+
+  // Opps Created by owner name
+  const oppMap = sumBy(fOppsOwner,'owner');
+  const oppTop = topN(oppMap,15);
+  chartOpps = buildHBar('ch-opps',oppTop.map(x=>x[0]),oppTop.map(x=>x[1]),oppTop.map((_,i)=>PALETTE[i%PALETTE.length]),'opps',chartOpps);
+
+  // Closed Won by community
+  const wonMap = sumBy(fCW,'city');
+  const wonTop = topN(wonMap,12);
+  chartWon = buildBar('ch-won',wonTop.map(x=>x[0]),wonTop.map(x=>x[1]),wonTop.map(()=>'#38a169'),'won',chartWon);
+
+  // Closed Lost by community
+  const lostMap = sumBy(fLost,'city');
+  const lostTop = topN(lostMap,12);
+  chartLost = buildBar('ch-lost',lostTop.map(x=>x[0]),lostTop.map(x=>x[1]),lostTop.map(()=>'#e53e3e'),'lost',chartLost);
+}
+
+// ─── Buttons ───────────────────────────────────────────────────────────
+document.querySelectorAll('.dbtn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.dbtn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    update(btn.dataset.r, btn.textContent.trim());
+  });
+});
+
+// Default: Last Month
+(()=>{
+  const d = document.querySelector('[data-r="last-month"]');
+  d.classList.add('active');
+  update('last-month','Last Month');
+})();
+</script>
+</body>
+</html>
+"""
+
+# ──────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────
+def main():
+    if not TOKEN_NAME or not TOKEN_VALUE:
+        print("\nNo Tableau PAT credentials found.")
+        print("  Set TABLEAU_TOKEN_NAME and TABLEAU_TOKEN_VALUE env vars,")
+        print("  or edit this script to hard-code them.\n")
+        print("  Opening the dashboard with the last cached data set...\n")
+        use_cached = True
+    else:
+        use_cached = False
+
+    data_as_of = "cached data"
+    if use_cached:
+        leads, cw, lost, opps_owner, opps, leads_daily, leads_daily_src = _cached_data()
+    else:
+        print("1. Signing in...")
+        tok, sid = signin()
+        try:
+            print("2. Fetching view data from Tableau...")
+            leads_raw, atl_raw, opp_raw = fetch_all(tok, sid)
+            leads, cw, lost, opps_owner, opps, leads_daily, leads_daily_src = aggregate(leads_raw, atl_raw, opp_raw)
+            print("3. Fetching Tableau data refresh timestamp...")
+            data_as_of = get_view_updated_at(tok, sid, VIEW_ATL)
+            print(f"   Data as of: {data_as_of}")
+        finally:
+            signout(tok)
+
+    print(f"   Leads rows: {len(leads)}  |  Daily lead rows: {len(leads_daily)}  |  CW rows: {len(cw)}  |  Lost rows: {len(lost)}  |  Owner rows: {len(opps_owner)}  |  Opps rows: {len(opps)}")
+
+    html = (HTML_TEMPLATE
+            .replace("__LEADS__",      json.dumps(leads))
+            .replace("__CW__",         json.dumps(cw))
+            .replace("__LOST__",       json.dumps(lost))
+            .replace("__OPPS__",       json.dumps(opps))
+            .replace("__OPPS_OWNER__", json.dumps(opps_owner))
+            .replace("__GEO__",        json.dumps({k: list(v) for k, v in GEO.items()}))
+            .replace("__LEADS_DAILY__", json.dumps(leads_daily))
+            .replace("__LEADS_DAILY_SRC__", json.dumps(leads_daily_src))
+            .replace("__DATA_AS_OF__", data_as_of)
+            .replace("__GENERATED__",  datetime.now().strftime("%b %d, %Y %H:%M")))
+
+    with open(OUT_FILE, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"\nDashboard saved -> {OUT_FILE}")
+    print("   Opening in browser...")
+    webbrowser.open(OUT_FILE)
+
+
+# ──────────────────────────────────────────────────────────────
+# CACHED DATASET  (real data from Tableau MCP, Jan-Mar 2026)
+# ──────────────────────────────────────────────────────────────
+def _cached_data():
+    """Real production data fetched via Tableau MCP on 2026-03-18."""
+    leads = [
+        # ── January 2026 ──────────────────────────────────────────────
+        {"area":"Anna","source":"Apartments.com","month":"2026-01","count":1},
+        {"area":"Anna","source":"Phone Call","month":"2026-01","count":3},
+        {"area":"Anna","source":"Rently","month":"2026-01","count":1},
+        {"area":"Anna","source":"Website","month":"2026-01","count":6},
+        {"area":"Anna","source":"Zillow","month":"2026-01","count":16},
+        {"area":"Anna","source":"Zillow MFR","month":"2026-01","count":14},
+        {"area":"Blue Ridge","source":"Apartments.com","month":"2026-01","count":1},
+        {"area":"Blue Ridge","source":"Website","month":"2026-01","count":3},
+        {"area":"Blue Ridge","source":"Zillow","month":"2026-01","count":5},
+        {"area":"Boyd","source":"Drive-by / Saw a CooperZadeh Community","month":"2026-01","count":1},
+        {"area":"Boyd","source":"Phone Call","month":"2026-01","count":5},
+        {"area":"Boyd","source":"Rently","month":"2026-01","count":2},
+        {"area":"Boyd","source":"Website","month":"2026-01","count":2},
+        {"area":"Boyd","source":"Zillow","month":"2026-01","count":1},
+        {"area":"Celina","source":"Website","month":"2026-01","count":1},
+        {"area":"Celina","source":"Zillow","month":"2026-01","count":2},
+        {"area":"Cleveland","source":"Website","month":"2026-01","count":1},
+        {"area":"Dallas","source":"Apartments.com","month":"2026-01","count":2},
+        {"area":"Dallas","source":"Findigs","month":"2026-01","count":2},
+        {"area":"Dallas","source":"Informal Walk-In","month":"2026-01","count":3},
+        {"area":"Dallas","source":"Online Search","month":"2026-01","count":2},
+        {"area":"Dallas","source":"Phone Call","month":"2026-01","count":13},
+        {"area":"Dallas","source":"Referral from a Friend or Family Member","month":"2026-01","count":1},
+        {"area":"Dallas","source":"Referral Program","month":"2026-01","count":1},
+        {"area":"Dallas","source":"Rently","month":"2026-01","count":1},
+        {"area":"Dallas","source":"Website","month":"2026-01","count":62},
+        {"area":"Dallas","source":"Website-Others","month":"2026-01","count":1},
+        {"area":"Dallas","source":"Yard Signs","month":"2026-01","count":1},
+        {"area":"Dallas","source":"Zillow","month":"2026-01","count":83},
+        {"area":"Dallas-West","source":"Informal Walk-In","month":"2026-01","count":1},
+        {"area":"Decatur","source":"Website","month":"2026-01","count":2},
+        {"area":"Decatur","source":"Zillow","month":"2026-01","count":3},
+        {"area":"Durant","source":"Website","month":"2026-01","count":8},
+        {"area":"Durant","source":"Zillow","month":"2026-01","count":20},
+        {"area":"Durant","source":"Zillow MFR","month":"2026-01","count":22},
+        {"area":"Farmersville","source":"Direct Mail","month":"2026-01","count":1},
+        {"area":"Farmersville","source":"Facebook","month":"2026-01","count":4},
+        {"area":"Farmersville","source":"Facebook-Personal","month":"2026-01","count":2},
+        {"area":"Farmersville","source":"Open House / Community Event","month":"2026-01","count":3},
+        {"area":"Farmersville","source":"Other (please specify)","month":"2026-01","count":2},
+        {"area":"Farmersville","source":"Phone Call","month":"2026-01","count":3},
+        {"area":"Farmersville","source":"Referral from a Friend or Family Member","month":"2026-01","count":1},
+        {"area":"Farmersville","source":"Rently","month":"2026-01","count":1},
+        {"area":"Farmersville","source":"Social Media","month":"2026-01","count":1},
+        {"area":"Farmersville","source":"Website","month":"2026-01","count":3},
+        {"area":"Farmersville","source":"Zillow","month":"2026-01","count":19},
+        {"area":"Farmersville","source":"Zillow MFR","month":"2026-01","count":4},
+        {"area":"Fort Worth","source":"Facebook","month":"2026-01","count":1},
+        {"area":"Fort Worth","source":"Phone Call","month":"2026-01","count":5},
+        {"area":"Fort Worth","source":"Website","month":"2026-01","count":8},
+        {"area":"Fort Worth","source":"Zillow","month":"2026-01","count":20},
+        {"area":"Fort Worth","source":"Zillow MFR","month":"2026-01","count":1},
+        {"area":"Houston","source":"Facebook","month":"2026-01","count":1},
+        {"area":"Houston","source":"Facebook-Personal","month":"2026-01","count":20},
+        {"area":"Houston","source":"Rently","month":"2026-01","count":1},
+        {"area":"Houston","source":"Website","month":"2026-01","count":9},
+        {"area":"Houston","source":"Zillow","month":"2026-01","count":16},
+        {"area":"Houston","source":"Zillow MFR","month":"2026-01","count":19},
+        {"area":"Mabank","source":"Apartments.com","month":"2026-01","count":5},
+        {"area":"Mabank","source":"Buildium","month":"2026-01","count":2},
+        {"area":"Mabank","source":"Drive-by / Saw a CooperZadeh Community","month":"2026-01","count":1},
+        {"area":"Mabank","source":"Facebook","month":"2026-01","count":2},
+        {"area":"Mabank","source":"Findigs","month":"2026-01","count":1},
+        {"area":"Mabank","source":"Informal Walk-In","month":"2026-01","count":2},
+        {"area":"Mabank","source":"Online Search","month":"2026-01","count":2},
+        {"area":"Mabank","source":"Phone Call","month":"2026-01","count":9},
+        {"area":"Mabank","source":"Rently","month":"2026-01","count":3},
+        {"area":"Mabank","source":"Social Media","month":"2026-01","count":1},
+        {"area":"Mabank","source":"Website","month":"2026-01","count":21},
+        {"area":"Mabank","source":"Website-Others","month":"2026-01","count":3},
+        {"area":"Mabank","source":"Zillow","month":"2026-01","count":46},
+        {"area":"Mabank","source":"Zillow MFR","month":"2026-01","count":28},
+        {"area":"Mesquite","source":"Facebook","month":"2026-01","count":2},
+        {"area":"Mesquite","source":"Informal Walk-In","month":"2026-01","count":1},
+        {"area":"Mesquite","source":"Online Search","month":"2026-01","count":1},
+        {"area":"Mesquite","source":"Phone Call","month":"2026-01","count":3},
+        {"area":"Mesquite","source":"Rently","month":"2026-01","count":3},
+        {"area":"Mesquite","source":"Website","month":"2026-01","count":4},
+        {"area":"Mesquite","source":"Zillow","month":"2026-01","count":2},
+        {"area":"Mesquite","source":"Zillow MFR","month":"2026-01","count":25},
+        {"area":"Others","source":"Buildium","month":"2026-01","count":3},
+        {"area":"Others","source":"Website","month":"2026-01","count":2},
+        {"area":"Others","source":"Zillow","month":"2026-01","count":1},
+        {"area":"Others","source":"Zillow MFR","month":"2026-01","count":1},
+        {"area":"Princeton","source":"Buildium","month":"2026-01","count":1},
+        {"area":"Princeton","source":"Facebook","month":"2026-01","count":1},
+        {"area":"Princeton","source":"Open House / Community Event","month":"2026-01","count":1},
+        {"area":"Princeton","source":"Phone Call","month":"2026-01","count":1},
+        {"area":"Princeton","source":"Website","month":"2026-01","count":4},
+        {"area":"Princeton","source":"Zillow","month":"2026-01","count":14},
+        {"area":"Red Oak","source":"Apartments.com","month":"2026-01","count":1},
+        {"area":"Red Oak","source":"Informal Walk-In","month":"2026-01","count":5},
+        {"area":"Red Oak","source":"Phone Call","month":"2026-01","count":13},
+        {"area":"Red Oak","source":"Referral from a Friend or Family Member","month":"2026-01","count":1},
+        {"area":"Red Oak","source":"Referral Program","month":"2026-01","count":1},
+        {"area":"Red Oak","source":"Rently","month":"2026-01","count":4},
+        {"area":"Red Oak","source":"Website","month":"2026-01","count":18},
+        {"area":"Red Oak","source":"Zillow","month":"2026-01","count":54},
+        {"area":"Red Oak","source":"Zillow MFR","month":"2026-01","count":76},
+        {"area":"Terrell","source":"Phone Call","month":"2026-01","count":1},
+        {"area":"Tyler","source":"Apartments.com","month":"2026-01","count":3},
+        {"area":"Tyler","source":"Phone Call","month":"2026-01","count":15},
+        {"area":"Tyler","source":"Website","month":"2026-01","count":7},
+        {"area":"Tyler","source":"Zillow","month":"2026-01","count":21},
+        {"area":"Tyler","source":"Zillow MFR","month":"2026-01","count":30},
+        {"area":"Waxahachie","source":"Phone Call","month":"2026-01","count":6},
+        {"area":"Waxahachie","source":"Website","month":"2026-01","count":10},
+        {"area":"Waxahachie","source":"Zillow","month":"2026-01","count":31},
+        {"area":"Waxahachie","source":"Zillow MFR","month":"2026-01","count":42},
+        # ── February 2026 ─────────────────────────────────────────────
+        {"area":"Anna","source":"Facebook-Personal","month":"2026-02","count":1},
+        {"area":"Anna","source":"Google-Ad","month":"2026-02","count":1},
+        {"area":"Anna","source":"Phone Call","month":"2026-02","count":2},
+        {"area":"Anna","source":"Realtor","month":"2026-02","count":2},
+        {"area":"Anna","source":"Rently","month":"2026-02","count":2},
+        {"area":"Anna","source":"Website","month":"2026-02","count":7},
+        {"area":"Anna","source":"Zillow","month":"2026-02","count":14},
+        {"area":"Anna","source":"Zillow MFR","month":"2026-02","count":29},
+        {"area":"Blue Ridge","source":"Facebook-Personal","month":"2026-02","count":1},
+        {"area":"Blue Ridge","source":"Informal Walk-In","month":"2026-02","count":1},
+        {"area":"Blue Ridge","source":"Website","month":"2026-02","count":3},
+        {"area":"Blue Ridge","source":"Zillow","month":"2026-02","count":1},
+        {"area":"Boyd","source":"Facebook-Personal","month":"2026-02","count":3},
+        {"area":"Boyd","source":"Phone Call","month":"2026-02","count":5},
+        {"area":"Boyd","source":"Website","month":"2026-02","count":6},
+        {"area":"Boyd","source":"Zillow","month":"2026-02","count":4},
+        {"area":"Boyd","source":"Zillow MFR","month":"2026-02","count":1},
+        {"area":"Brownsboro","source":"Phone Call","month":"2026-02","count":1},
+        {"area":"Celina","source":"Facebook-Personal","month":"2026-02","count":2},
+        {"area":"Celina","source":"Phone Call","month":"2026-02","count":1},
+        {"area":"Celina","source":"Rently","month":"2026-02","count":1},
+        {"area":"Celina","source":"Zillow","month":"2026-02","count":3},
+        {"area":"Cleveland","source":"Facebook","month":"2026-02","count":1},
+        {"area":"Cleveland","source":"Phone Call","month":"2026-02","count":1},
+        {"area":"Cleveland","source":"Website","month":"2026-02","count":1},
+        {"area":"Cleveland","source":"Zillow","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Apartments.com","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Billboard","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Buildium","month":"2026-02","count":2},
+        {"area":"Dallas","source":"Facebook","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Facebook-Personal","month":"2026-02","count":2},
+        {"area":"Dallas","source":"Online Search","month":"2026-02","count":4},
+        {"area":"Dallas","source":"Other (please specify)","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Phone Call","month":"2026-02","count":6},
+        {"area":"Dallas","source":"Referral from a Friend or Family Member","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Social Media","month":"2026-02","count":1},
+        {"area":"Dallas","source":"TikTok","month":"2026-02","count":1},
+        {"area":"Dallas","source":"Website","month":"2026-02","count":50},
+        {"area":"Dallas","source":"Zillow","month":"2026-02","count":85},
+        {"area":"Decatur","source":"Other (please specify)","month":"2026-02","count":1},
+        {"area":"Decatur","source":"Website","month":"2026-02","count":2},
+        {"area":"Decatur","source":"Zillow","month":"2026-02","count":7},
+        {"area":"Durant","source":"Phone Call","month":"2026-02","count":1},
+        {"area":"Durant","source":"Website","month":"2026-02","count":6},
+        {"area":"Durant","source":"Zillow","month":"2026-02","count":5},
+        {"area":"Durant","source":"Zillow MFR","month":"2026-02","count":25},
+        {"area":"Farmersville","source":"Facebook","month":"2026-02","count":6},
+        {"area":"Farmersville","source":"Facebook-Personal","month":"2026-02","count":5},
+        {"area":"Farmersville","source":"Phone Call","month":"2026-02","count":5},
+        {"area":"Farmersville","source":"Website","month":"2026-02","count":5},
+        {"area":"Farmersville","source":"Zillow","month":"2026-02","count":15},
+        {"area":"Farmersville","source":"Zillow MFR","month":"2026-02","count":4},
+        {"area":"Fort Worth","source":"Phone Call","month":"2026-02","count":3},
+        {"area":"Fort Worth","source":"Website","month":"2026-02","count":8},
+        {"area":"Fort Worth","source":"Zillow","month":"2026-02","count":20},
+        {"area":"Fort Worth","source":"Zillow MFR","month":"2026-02","count":1},
+        {"area":"Houston","source":"Drive-by / Saw a CooperZadeh Community","month":"2026-02","count":3},
+        {"area":"Houston","source":"Facebook","month":"2026-02","count":12},
+        {"area":"Houston","source":"Facebook-Personal","month":"2026-02","count":45},
+        {"area":"Houston","source":"Open House / Community Event","month":"2026-02","count":2},
+        {"area":"Houston","source":"Other (please specify)","month":"2026-02","count":2},
+        {"area":"Houston","source":"Phone Call","month":"2026-02","count":1},
+        {"area":"Houston","source":"Website","month":"2026-02","count":14},
+        {"area":"Houston","source":"Zillow","month":"2026-02","count":23},
+        {"area":"Houston","source":"Zillow MFR","month":"2026-02","count":42},
+        {"area":"Mabank","source":"Apartments.com","month":"2026-02","count":7},
+        {"area":"Mabank","source":"Facebook","month":"2026-02","count":3},
+        {"area":"Mabank","source":"Facebook-Personal","month":"2026-02","count":2},
+        {"area":"Mabank","source":"Findigs","month":"2026-02","count":2},
+        {"area":"Mabank","source":"Informal Walk-In","month":"2026-02","count":1},
+        {"area":"Mabank","source":"Phone Call","month":"2026-02","count":17},
+        {"area":"Mabank","source":"Referral from a Friend or Family Member","month":"2026-02","count":1},
+        {"area":"Mabank","source":"Rently","month":"2026-02","count":1},
+        {"area":"Mabank","source":"Social Media","month":"2026-02","count":1},
+        {"area":"Mabank","source":"Website","month":"2026-02","count":14},
+        {"area":"Mabank","source":"Website-Others","month":"2026-02","count":1},
+        {"area":"Mabank","source":"Yard Signs","month":"2026-02","count":1},
+        {"area":"Mabank","source":"Zillow","month":"2026-02","count":47},
+        {"area":"Mabank","source":"Zillow MFR","month":"2026-02","count":22},
+        {"area":"Mesquite","source":"Apartments.com","month":"2026-02","count":2},
+        {"area":"Mesquite","source":"Findigs","month":"2026-02","count":1},
+        {"area":"Mesquite","source":"Online Search","month":"2026-02","count":1},
+        {"area":"Mesquite","source":"Phone Call","month":"2026-02","count":2},
+        {"area":"Mesquite","source":"Rently","month":"2026-02","count":1},
+        {"area":"Mesquite","source":"Website","month":"2026-02","count":19},
+        {"area":"Mesquite","source":"Zillow","month":"2026-02","count":17},
+        {"area":"Mesquite","source":"Zillow MFR","month":"2026-02","count":32},
+        {"area":"Others","source":"Facebook","month":"2026-02","count":1},
+        {"area":"Others","source":"Facebook-Personal","month":"2026-02","count":2},
+        {"area":"Others","source":"Website","month":"2026-02","count":2},
+        {"area":"Others","source":"Zillow","month":"2026-02","count":9},
+        {"area":"Others","source":"Zillow MFR","month":"2026-02","count":1},
+        {"area":"Princeton","source":"Apartments.com","month":"2026-02","count":2},
+        {"area":"Princeton","source":"Facebook","month":"2026-02","count":16},
+        {"area":"Princeton","source":"Facebook-Personal","month":"2026-02","count":7},
+        {"area":"Princeton","source":"Phone Call","month":"2026-02","count":4},
+        {"area":"Princeton","source":"Website","month":"2026-02","count":12},
+        {"area":"Princeton","source":"Zillow","month":"2026-02","count":46},
+        {"area":"Red Oak","source":"Apartments.com","month":"2026-02","count":1},
+        {"area":"Red Oak","source":"Buildium","month":"2026-02","count":2},
+        {"area":"Red Oak","source":"Findigs","month":"2026-02","count":1},
+        {"area":"Red Oak","source":"Informal Walk-In","month":"2026-02","count":5},
+        {"area":"Red Oak","source":"Online Search","month":"2026-02","count":2},
+        {"area":"Red Oak","source":"Phone Call","month":"2026-02","count":13},
+        {"area":"Red Oak","source":"Referral from a Friend or Family Member","month":"2026-02","count":3},
+        {"area":"Red Oak","source":"Referral Program","month":"2026-02","count":1},
+        {"area":"Red Oak","source":"Website","month":"2026-02","count":12},
+        {"area":"Red Oak","source":"Website-Others","month":"2026-02","count":1},
+        {"area":"Red Oak","source":"Yard Signs","month":"2026-02","count":2},
+        {"area":"Red Oak","source":"Zillow","month":"2026-02","count":33},
+        {"area":"Red Oak","source":"Zillow MFR","month":"2026-02","count":84},
+        {"area":"Tyler","source":"Apartments.com","month":"2026-02","count":3},
+        {"area":"Tyler","source":"Facebook","month":"2026-02","count":1},
+        {"area":"Tyler","source":"Phone Call","month":"2026-02","count":15},
+        {"area":"Tyler","source":"Rently","month":"2026-02","count":2},
+        {"area":"Tyler","source":"Website","month":"2026-02","count":7},
+        {"area":"Tyler","source":"Zillow","month":"2026-02","count":37},
+        {"area":"Tyler","source":"Zillow MFR","month":"2026-02","count":51},
+        {"area":"Waxahachie","source":"Google-Website","month":"2026-02","count":1},
+        {"area":"Waxahachie","source":"Online Search","month":"2026-02","count":2},
+        {"area":"Waxahachie","source":"Phone Call","month":"2026-02","count":1},
+        {"area":"Waxahachie","source":"Rently","month":"2026-02","count":1},
+        {"area":"Waxahachie","source":"Website","month":"2026-02","count":11},
+        {"area":"Waxahachie","source":"Zillow","month":"2026-02","count":20},
+        {"area":"Waxahachie","source":"Zillow MFR","month":"2026-02","count":66},
+        # ── March 2026 ────────────────────────────────────────────────
+        {"area":"Anna","source":"Website","month":"2026-03","count":2},
+        {"area":"Anna","source":"Zillow","month":"2026-03","count":4},
+        {"area":"Anna","source":"Zillow MFR","month":"2026-03","count":20},
+        {"area":"Blue Ridge","source":"Facebook-Personal","month":"2026-03","count":1},
+        {"area":"Blue Ridge","source":"Website","month":"2026-03","count":3},
+        {"area":"Blue Ridge","source":"Zillow","month":"2026-03","count":8},
+        {"area":"Boyd","source":"Other (please specify)","month":"2026-03","count":1},
+        {"area":"Boyd","source":"Phone Call","month":"2026-03","count":6},
+        {"area":"Boyd","source":"Website","month":"2026-03","count":2},
+        {"area":"Boyd","source":"Zillow","month":"2026-03","count":5},
+        {"area":"Celina","source":"Facebook-Personal","month":"2026-03","count":1},
+        {"area":"Celina","source":"Zillow","month":"2026-03","count":4},
+        {"area":"Crowley","source":"Zillow","month":"2026-03","count":26},
+        {"area":"Dallas","source":"Informal Walk-In","month":"2026-03","count":2},
+        {"area":"Dallas","source":"Online Search","month":"2026-03","count":1},
+        {"area":"Dallas","source":"Open House / Community Event","month":"2026-03","count":1},
+        {"area":"Dallas","source":"Referral from a Friend or Family Member","month":"2026-03","count":3},
+        {"area":"Dallas","source":"Referral Program","month":"2026-03","count":1},
+        {"area":"Dallas","source":"Rently","month":"2026-03","count":1},
+        {"area":"Dallas","source":"Website","month":"2026-03","count":24},
+        {"area":"Dallas","source":"Zillow","month":"2026-03","count":30},
+        {"area":"Dallas-West","source":"Phone Call","month":"2026-03","count":1},
+        {"area":"Dallas-West","source":"Website","month":"2026-03","count":1},
+        {"area":"Decatur","source":"Facebook-Personal","month":"2026-03","count":1},
+        {"area":"Decatur","source":"Website","month":"2026-03","count":6},
+        {"area":"Decatur","source":"Zillow","month":"2026-03","count":10},
+        {"area":"Denton","source":"Phone Call","month":"2026-03","count":1},
+        {"area":"Denton","source":"Website","month":"2026-03","count":1},
+        {"area":"Denton","source":"Zillow","month":"2026-03","count":15},
+        {"area":"Durant","source":"Website","month":"2026-03","count":4},
+        {"area":"Durant","source":"Zillow","month":"2026-03","count":5},
+        {"area":"Durant","source":"Zillow MFR","month":"2026-03","count":10},
+        {"area":"Farmersville","source":"Facebook-Personal","month":"2026-03","count":8},
+        {"area":"Farmersville","source":"Informal Walk-In","month":"2026-03","count":1},
+        {"area":"Farmersville","source":"Website","month":"2026-03","count":4},
+        {"area":"Farmersville","source":"Zillow","month":"2026-03","count":5},
+        {"area":"Farmersville","source":"Zillow MFR","month":"2026-03","count":11},
+        {"area":"Fort Worth","source":"Phone Call","month":"2026-03","count":3},
+        {"area":"Fort Worth","source":"Website","month":"2026-03","count":1},
+        {"area":"Fort Worth","source":"Zillow","month":"2026-03","count":18},
+        {"area":"Houston","source":"Facebook","month":"2026-03","count":1},
+        {"area":"Houston","source":"Facebook-Personal","month":"2026-03","count":15},
+        {"area":"Houston","source":"Other (please specify)","month":"2026-03","count":1},
+        {"area":"Houston","source":"Website","month":"2026-03","count":4},
+        {"area":"Houston","source":"Zillow","month":"2026-03","count":5},
+        {"area":"Houston","source":"Zillow MFR","month":"2026-03","count":39},
+        {"area":"Mabank","source":"Apartments.com","month":"2026-03","count":2},
+        {"area":"Mabank","source":"Facebook","month":"2026-03","count":4},
+        {"area":"Mabank","source":"Facebook-Personal","month":"2026-03","count":2},
+        {"area":"Mabank","source":"Phone Call","month":"2026-03","count":14},
+        {"area":"Mabank","source":"Rently","month":"2026-03","count":1},
+        {"area":"Mabank","source":"Social Media","month":"2026-03","count":1},
+        {"area":"Mabank","source":"Website","month":"2026-03","count":7},
+        {"area":"Mabank","source":"Website-Others","month":"2026-03","count":2},
+        {"area":"Mabank","source":"Yard Signs","month":"2026-03","count":1},
+        {"area":"Mabank","source":"Zillow","month":"2026-03","count":7},
+        {"area":"Mabank","source":"Zillow MFR","month":"2026-03","count":26},
+        {"area":"Mesquite","source":"Phone Call","month":"2026-03","count":1},
+        {"area":"Mesquite","source":"Website","month":"2026-03","count":4},
+        {"area":"Mesquite","source":"Zillow","month":"2026-03","count":7},
+        {"area":"Mesquite","source":"Zillow MFR","month":"2026-03","count":24},
+        {"area":"Others","source":"Website","month":"2026-03","count":2},
+        {"area":"Others","source":"Zillow","month":"2026-03","count":6},
+        {"area":"Others","source":"Zillow MFR","month":"2026-03","count":15},
+        {"area":"Princeton","source":"Apartments.com","month":"2026-03","count":1},
+        {"area":"Princeton","source":"Facebook","month":"2026-03","count":2},
+        {"area":"Princeton","source":"Facebook-Personal","month":"2026-03","count":9},
+        {"area":"Princeton","source":"Online Search","month":"2026-03","count":1},
+        {"area":"Princeton","source":"Phone Call","month":"2026-03","count":2},
+        {"area":"Princeton","source":"Website","month":"2026-03","count":9},
+        {"area":"Princeton","source":"Zillow","month":"2026-03","count":24},
+        {"area":"Princeton","source":"Zillow MFR","month":"2026-03","count":1},
+        {"area":"Red Oak","source":"Drive-by / Saw a CooperZadeh Community","month":"2026-03","count":1},
+        {"area":"Red Oak","source":"Findigs","month":"2026-03","count":1},
+        {"area":"Red Oak","source":"Informal Walk-In","month":"2026-03","count":5},
+        {"area":"Red Oak","source":"Phone Call","month":"2026-03","count":12},
+        {"area":"Red Oak","source":"Realtor","month":"2026-03","count":1},
+        {"area":"Red Oak","source":"Referral from a Friend or Family Member","month":"2026-03","count":3},
+        {"area":"Red Oak","source":"Social Media","month":"2026-03","count":1},
+        {"area":"Red Oak","source":"Website","month":"2026-03","count":6},
+        {"area":"Red Oak","source":"Yard Signs","month":"2026-03","count":1},
+        {"area":"Red Oak","source":"Zillow","month":"2026-03","count":23},
+        {"area":"Red Oak","source":"Zillow MFR","month":"2026-03","count":78},
+        {"area":"Royse City","source":"Zillow","month":"2026-03","count":3},
+        {"area":"Sherman","source":"Zillow","month":"2026-03","count":12},
+        {"area":"Terrell","source":"Google-Ad","month":"2026-03","count":1},
+        {"area":"Terrell","source":"Zillow","month":"2026-03","count":2},
+        {"area":"Tyler","source":"Phone Call","month":"2026-03","count":2},
+        {"area":"Tyler","source":"Website","month":"2026-03","count":3},
+        {"area":"Tyler","source":"Zillow","month":"2026-03","count":22},
+        {"area":"Tyler","source":"Zillow MFR","month":"2026-03","count":31},
+        {"area":"Waxahachie","source":"Online Search","month":"2026-03","count":1},
+        {"area":"Waxahachie","source":"Phone Call","month":"2026-03","count":1},
+        {"area":"Waxahachie","source":"Website","month":"2026-03","count":8},
+        {"area":"Waxahachie","source":"Zillow","month":"2026-03","count":12},
+        {"area":"Waxahachie","source":"Zillow MFR","month":"2026-03","count":57},
+    ]
+
+    cw = [
+        {"date": "2026-01-02", "city": "Dallas", "count": 2},
+        {"date": "2026-01-02", "city": "Durant", "count": 1},
+        {"date": "2026-01-02", "city": "Mabank", "count": 1},
+        {"date": "2026-01-03", "city": "Dallas", "count": 2},
+        {"date": "2026-01-03", "city": "Fort Worth", "count": 1},
+        {"date": "2026-01-03", "city": "Mabank", "count": 2},
+        {"date": "2026-01-03", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-03", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-04", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-05", "city": "Durant", "count": 1},
+        {"date": "2026-01-05", "city": "Mabank", "count": 1},
+        {"date": "2026-01-06", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-07", "city": "Mabank", "count": 1},
+        {"date": "2026-01-07", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-08", "city": "Boyd", "count": 1},
+        {"date": "2026-01-08", "city": "Durant", "count": 1},
+        {"date": "2026-01-09", "city": "Mabank", "count": 1},
+        {"date": "2026-01-09", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-09", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-10", "city": "Mabank", "count": 1},
+        {"date": "2026-01-11", "city": "Mabank", "count": 1},
+        {"date": "2026-01-12", "city": "Anna", "count": 1},
+        {"date": "2026-01-12", "city": "Mabank", "count": 1},
+        {"date": "2026-01-12", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-13", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-13", "city": "Tyler", "count": 2},
+        {"date": "2026-01-14", "city": "Mabank", "count": 1},
+        {"date": "2026-01-15", "city": "Dallas", "count": 1},
+        {"date": "2026-01-15", "city": "Mabank", "count": 1},
+        {"date": "2026-01-16", "city": "Durant", "count": 1},
+        {"date": "2026-01-16", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-16", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-17", "city": "Decatur", "count": 1},
+        {"date": "2026-01-17", "city": "Mabank", "count": 1},
+        {"date": "2026-01-17", "city": "Red Oak", "count": 3},
+        {"date": "2026-01-18", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-19", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-20", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-21", "city": "Tyler", "count": 1},
+        {"date": "2026-01-22", "city": "Decatur", "count": 1},
+        {"date": "2026-01-22", "city": "Mabank", "count": 1},
+        {"date": "2026-01-22", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-22", "city": "Tyler", "count": 1},
+        {"date": "2026-01-23", "city": "Mabank", "count": 1},
+        {"date": "2026-01-23", "city": "Tyler", "count": 1},
+        {"date": "2026-01-28", "city": "Mesquite", "count": 1},
+        {"date": "2026-01-29", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-30", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-01-30", "city": "Boyd", "count": 1},
+        {"date": "2026-01-30", "city": "Mabank", "count": 1},
+        {"date": "2026-02-01", "city": "Boyd", "count": 1},
+        {"date": "2026-02-02", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-03", "city": "Mabank", "count": 1},
+        {"date": "2026-02-04", "city": "Durant", "count": 1},
+        {"date": "2026-02-05", "city": "Tyler", "count": 1},
+        {"date": "2026-02-06", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-07", "city": "Boyd", "count": 2},
+        {"date": "2026-02-07", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-08", "city": "Dallas", "count": 1},
+        {"date": "2026-02-08", "city": "Tyler", "count": 1},
+        {"date": "2026-02-09", "city": "Decatur", "count": 1},
+        {"date": "2026-02-10", "city": "Tyler", "count": 2},
+        {"date": "2026-02-11", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-12", "city": "Boyd", "count": 1},
+        {"date": "2026-02-14", "city": "Dallas", "count": 1},
+        {"date": "2026-02-15", "city": "Mabank", "count": 1},
+        {"date": "2026-02-16", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-02-16", "city": "Mabank", "count": 1},
+        {"date": "2026-02-16", "city": "Princeton", "count": 1},
+        {"date": "2026-02-16", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-17", "city": "Boyd", "count": 1},
+        {"date": "2026-02-17", "city": "Dallas", "count": 1},
+        {"date": "2026-02-17", "city": "Mabank", "count": 1},
+        {"date": "2026-02-19", "city": "Princeton", "count": 1},
+        {"date": "2026-02-20", "city": "Princeton", "count": 1},
+        {"date": "2026-02-20", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-22", "city": "Princeton", "count": 1},
+        {"date": "2026-02-23", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-02-23", "city": "Decatur", "count": 1},
+        {"date": "2026-02-23", "city": "Mabank", "count": 1},
+        {"date": "2026-02-25", "city": "Dallas", "count": 1},
+        {"date": "2026-02-25", "city": "Waxahachie", "count": 1},
+        {"date": "2026-02-26", "city": "Mabank", "count": 1}
+    ]
+
+    lost = [
+        {"date": "2026-01-03", "city": "Dallas", "count": 1},
+        {"date": "2026-01-05", "city": "Mabank", "count": 1},
+        {"date": "2026-01-06", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-07", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-07", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-08", "city": "Mabank", "count": 3},
+        {"date": "2026-01-08", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-10", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-10", "city": "Tyler", "count": 1},
+        {"date": "2026-01-11", "city": "Durant", "count": 1},
+        {"date": "2026-01-11", "city": "Tyler", "count": 1},
+        {"date": "2026-01-12", "city": "Tyler", "count": 1},
+        {"date": "2026-01-13", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-14", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-14", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-14", "city": "Tyler", "count": 1},
+        {"date": "2026-01-15", "city": "Dallas", "count": 1},
+        {"date": "2026-01-15", "city": "Mabank", "count": 1},
+        {"date": "2026-01-15", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-16", "city": "Mesquite", "count": 1},
+        {"date": "2026-01-16", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-18", "city": "Mabank", "count": 1},
+        {"date": "2026-01-18", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-19", "city": "Tyler", "count": 1},
+        {"date": "2026-01-20", "city": "Decatur", "count": 1},
+        {"date": "2026-01-20", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-22", "city": "Mabank", "count": 1},
+        {"date": "2026-01-22", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-24", "city": "Boyd", "count": 1},
+        {"date": "2026-01-24", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-26", "city": "Durant", "count": 1},
+        {"date": "2026-01-27", "city": "Mabank", "count": 1},
+        {"date": "2026-01-27", "city": "Mesquite", "count": 1},
+        {"date": "2026-01-27", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-27", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-28", "city": "Mabank", "count": 1},
+        {"date": "2026-01-28", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-28", "city": "Tyler", "count": 1},
+        {"date": "2026-01-29", "city": "Dallas", "count": 1},
+        {"date": "2026-02-01", "city": "Dallas", "count": 1},
+        {"date": "2026-02-01", "city": "Durant", "count": 1},
+        {"date": "2026-02-01", "city": "Mabank", "count": 1},
+        {"date": "2026-02-01", "city": "Tyler", "count": 1},
+        {"date": "2026-02-02", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-03", "city": "Mabank", "count": 1},
+        {"date": "2026-02-04", "city": "Anna", "count": 1},
+        {"date": "2026-02-05", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-06", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-06", "city": "Decatur", "count": 1},
+        {"date": "2026-02-06", "city": "Tyler", "count": 1},
+        {"date": "2026-02-07", "city": "Dallas", "count": 1},
+        {"date": "2026-02-07", "city": "Red Oak", "count": 3},
+        {"date": "2026-02-08", "city": "Dallas", "count": 1},
+        {"date": "2026-02-08", "city": "Tyler", "count": 1},
+        {"date": "2026-02-09", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-09", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-09", "city": "Waxahachie", "count": 3},
+        {"date": "2026-02-10", "city": "Dallas", "count": 1},
+        {"date": "2026-02-10", "city": "Durant", "count": 1},
+        {"date": "2026-02-10", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-11", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-11", "city": "Decatur", "count": 1},
+        {"date": "2026-02-11", "city": "Mabank", "count": 2},
+        {"date": "2026-02-11", "city": "Princeton", "count": 1},
+        {"date": "2026-02-11", "city": "Red Oak", "count": 2},
+        {"date": "2026-02-11", "city": "Tyler", "count": 1},
+        {"date": "2026-02-12", "city": "Anna", "count": 1},
+        {"date": "2026-02-12", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-12", "city": "Decatur", "count": 1},
+        {"date": "2026-02-13", "city": "Tyler", "count": 1},
+        {"date": "2026-02-14", "city": "Tyler", "count": 1},
+        {"date": "2026-02-17", "city": "Dallas", "count": 1},
+        {"date": "2026-02-17", "city": "Mabank", "count": 1},
+        {"date": "2026-02-17", "city": "Waxahachie", "count": 1},
+        {"date": "2026-02-18", "city": "Anna", "count": 1},
+        {"date": "2026-02-18", "city": "Dallas", "count": 1},
+        {"date": "2026-02-18", "city": "Mabank", "count": 1},
+        {"date": "2026-02-18", "city": "Red Oak", "count": 2},
+        {"date": "2026-02-19", "city": "Anna", "count": 1},
+        {"date": "2026-02-19", "city": "Waxahachie", "count": 1},
+        {"date": "2026-02-20", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-20", "city": "Hutchins", "count": 1},
+        {"date": "2026-02-20", "city": "Mabank", "count": 1},
+        {"date": "2026-02-20", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-21", "city": "Mesquite", "count": 1},
+        {"date": "2026-02-21", "city": "Princeton", "count": 1},
+        {"date": "2026-02-21", "city": "Tyler", "count": 2},
+        {"date": "2026-02-22", "city": "Dallas", "count": 1},
+        {"date": "2026-02-23", "city": "Mabank", "count": 1},
+        {"date": "2026-02-23", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-23", "city": "Tyler", "count": 1},
+        {"date": "2026-02-24", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-25", "city": "Boyd", "count": 1},
+        {"date": "2026-02-25", "city": "Dallas", "count": 1},
+        {"date": "2026-02-25", "city": "Waxahachie", "count": 1},
+        {"date": "2026-02-26", "city": "Dallas", "count": 1},
+        {"date": "2026-02-26", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-27", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-28", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-28", "city": "Princeton", "count": 1},
+        {"date": "2026-02-28", "city": "Red Oak", "count": 3},
+        {"date": "2026-02-28", "city": "Tyler", "count": 1},
+        {"date": "2026-03-01", "city": "Mabank", "count": 1},
+        {"date": "2026-03-02", "city": "Dallas", "count": 1},
+        {"date": "2026-03-02", "city": "Mabank", "count": 1},
+        {"date": "2026-03-02", "city": "Princeton", "count": 1},
+        {"date": "2026-03-02", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-03", "city": "Celina", "count": 1},
+        {"date": "2026-03-03", "city": "Princeton", "count": 1},
+        {"date": "2026-03-03", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-03", "city": "Tyler", "count": 1},
+        {"date": "2026-03-04", "city": "Mabank", "count": 2},
+        {"date": "2026-03-05", "city": "Decatur", "count": 1},
+        {"date": "2026-03-06", "city": "Princeton", "count": 1},
+        {"date": "2026-03-06", "city": "Waxahachie", "count": 1},
+        {"date": "2026-03-07", "city": "Hutchins", "count": 1},
+        {"date": "2026-03-08", "city": "Dallas", "count": 1},
+        {"date": "2026-03-08", "city": "Red Oak", "count": 2},
+        {"date": "2026-03-10", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-11", "city": "Mesquite", "count": 1},
+        {"date": "2026-03-11", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-13", "city": "Waxahachie", "count": 1},
+        {"date": "2026-03-14", "city": "Farmersville", "count": 1},
+        {"date": "2026-03-17", "city": "Red Oak", "count": 1}
+    ]
+
+    opps = [
+        {"date": "2026-01-02", "city": "Dallas", "count": 2},
+        {"date": "2026-01-02", "city": "Durant", "count": 1},
+        {"date": "2026-01-02", "city": "Mabank", "count": 1},
+        {"date": "2026-01-03", "city": "Dallas", "count": 3},
+        {"date": "2026-01-03", "city": "Fort Worth", "count": 1},
+        {"date": "2026-01-03", "city": "Mabank", "count": 2},
+        {"date": "2026-01-03", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-03", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-04", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-05", "city": "Durant", "count": 1},
+        {"date": "2026-01-05", "city": "Mabank", "count": 2},
+        {"date": "2026-01-06", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-06", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-07", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-07", "city": "Mabank", "count": 1},
+        {"date": "2026-01-07", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-08", "city": "Boyd", "count": 1},
+        {"date": "2026-01-08", "city": "Durant", "count": 1},
+        {"date": "2026-01-08", "city": "Mabank", "count": 3},
+        {"date": "2026-01-08", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-09", "city": "Mabank", "count": 1},
+        {"date": "2026-01-09", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-09", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-10", "city": "Mabank", "count": 1},
+        {"date": "2026-01-10", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-10", "city": "Tyler", "count": 1},
+        {"date": "2026-01-11", "city": "Durant", "count": 1},
+        {"date": "2026-01-11", "city": "Mabank", "count": 1},
+        {"date": "2026-01-11", "city": "Tyler", "count": 1},
+        {"date": "2026-01-12", "city": "Anna", "count": 1},
+        {"date": "2026-01-12", "city": "Mabank", "count": 1},
+        {"date": "2026-01-12", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-12", "city": "Tyler", "count": 1},
+        {"date": "2026-01-13", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-13", "city": "Tyler", "count": 2},
+        {"date": "2026-01-14", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-14", "city": "Mabank", "count": 1},
+        {"date": "2026-01-14", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-14", "city": "Tyler", "count": 1},
+        {"date": "2026-01-15", "city": "Dallas", "count": 2},
+        {"date": "2026-01-15", "city": "Mabank", "count": 2},
+        {"date": "2026-01-15", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-16", "city": "Durant", "count": 1},
+        {"date": "2026-01-16", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-16", "city": "Mesquite", "count": 1},
+        {"date": "2026-01-16", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-17", "city": "Decatur", "count": 1},
+        {"date": "2026-01-17", "city": "Mabank", "count": 1},
+        {"date": "2026-01-17", "city": "Red Oak", "count": 3},
+        {"date": "2026-01-18", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-18", "city": "Mabank", "count": 1},
+        {"date": "2026-01-18", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-19", "city": "Farmersville", "count": 1},
+        {"date": "2026-01-19", "city": "Tyler", "count": 1},
+        {"date": "2026-01-20", "city": "Decatur", "count": 1},
+        {"date": "2026-01-20", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-21", "city": "Tyler", "count": 1},
+        {"date": "2026-01-22", "city": "Decatur", "count": 1},
+        {"date": "2026-01-22", "city": "Mabank", "count": 2},
+        {"date": "2026-01-22", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-22", "city": "Tyler", "count": 1},
+        {"date": "2026-01-23", "city": "Mabank", "count": 1},
+        {"date": "2026-01-23", "city": "Tyler", "count": 1},
+        {"date": "2026-01-24", "city": "Boyd", "count": 1},
+        {"date": "2026-01-24", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-26", "city": "Durant", "count": 1},
+        {"date": "2026-01-27", "city": "Mabank", "count": 1},
+        {"date": "2026-01-27", "city": "Mesquite", "count": 1},
+        {"date": "2026-01-27", "city": "Red Oak", "count": 2},
+        {"date": "2026-01-27", "city": "Waxahachie", "count": 1},
+        {"date": "2026-01-28", "city": "Mabank", "count": 1},
+        {"date": "2026-01-28", "city": "Mesquite", "count": 1},
+        {"date": "2026-01-28", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-28", "city": "Tyler", "count": 1},
+        {"date": "2026-01-29", "city": "Dallas", "count": 1},
+        {"date": "2026-01-29", "city": "Red Oak", "count": 1},
+        {"date": "2026-01-30", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-01-30", "city": "Boyd", "count": 1},
+        {"date": "2026-01-30", "city": "Mabank", "count": 1},
+        {"date": "2026-01-31", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-01", "city": "Boyd", "count": 1},
+        {"date": "2026-02-01", "city": "Dallas", "count": 1},
+        {"date": "2026-02-01", "city": "Durant", "count": 1},
+        {"date": "2026-02-01", "city": "Mabank", "count": 1},
+        {"date": "2026-02-01", "city": "Tyler", "count": 1},
+        {"date": "2026-02-02", "city": "Red Oak", "count": 2},
+        {"date": "2026-02-03", "city": "Mabank", "count": 2},
+        {"date": "2026-02-04", "city": "Anna", "count": 1},
+        {"date": "2026-02-04", "city": "Durant", "count": 1},
+        {"date": "2026-02-05", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-05", "city": "Tyler", "count": 1},
+        {"date": "2026-02-06", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-06", "city": "Decatur", "count": 2},
+        {"date": "2026-02-06", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-06", "city": "Tyler", "count": 1},
+        {"date": "2026-02-07", "city": "Boyd", "count": 2},
+        {"date": "2026-02-07", "city": "Dallas", "count": 1},
+        {"date": "2026-02-07", "city": "Red Oak", "count": 4},
+        {"date": "2026-02-08", "city": "Dallas", "count": 2},
+        {"date": "2026-02-08", "city": "Tyler", "count": 2},
+        {"date": "2026-02-09", "city": "Decatur", "count": 1},
+        {"date": "2026-02-09", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-09", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-09", "city": "Waxahachie", "count": 3},
+        {"date": "2026-02-10", "city": "Dallas", "count": 1},
+        {"date": "2026-02-10", "city": "Durant", "count": 1},
+        {"date": "2026-02-10", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-10", "city": "Tyler", "count": 2},
+        {"date": "2026-02-11", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-11", "city": "Decatur", "count": 1},
+        {"date": "2026-02-11", "city": "Mabank", "count": 2},
+        {"date": "2026-02-11", "city": "Princeton", "count": 1},
+        {"date": "2026-02-11", "city": "Red Oak", "count": 3},
+        {"date": "2026-02-11", "city": "Tyler", "count": 1},
+        {"date": "2026-02-12", "city": "Anna", "count": 1},
+        {"date": "2026-02-12", "city": "Boyd", "count": 1},
+        {"date": "2026-02-12", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-12", "city": "Decatur", "count": 1},
+        {"date": "2026-02-12", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-13", "city": "Tyler", "count": 1},
+        {"date": "2026-02-14", "city": "Dallas", "count": 1},
+        {"date": "2026-02-14", "city": "Tyler", "count": 1},
+        {"date": "2026-02-15", "city": "Mabank", "count": 1},
+        {"date": "2026-02-16", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-02-16", "city": "Mabank", "count": 1},
+        {"date": "2026-02-16", "city": "Princeton", "count": 1},
+        {"date": "2026-02-16", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-17", "city": "Boyd", "count": 2},
+        {"date": "2026-02-17", "city": "Dallas", "count": 2},
+        {"date": "2026-02-17", "city": "Mabank", "count": 2},
+        {"date": "2026-02-17", "city": "Princeton", "count": 1},
+        {"date": "2026-02-17", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-17", "city": "Waxahachie", "count": 1},
+        {"date": "2026-02-18", "city": "Anna", "count": 1},
+        {"date": "2026-02-18", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-18", "city": "Dallas", "count": 1},
+        {"date": "2026-02-18", "city": "Mabank", "count": 1},
+        {"date": "2026-02-18", "city": "Red Oak", "count": 2},
+        {"date": "2026-02-19", "city": "Anna", "count": 1},
+        {"date": "2026-02-19", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-19", "city": "Princeton", "count": 1},
+        {"date": "2026-02-19", "city": "Waxahachie", "count": 1},
+        {"date": "2026-02-20", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-20", "city": "Hutchins", "count": 1},
+        {"date": "2026-02-20", "city": "Mabank", "count": 1},
+        {"date": "2026-02-20", "city": "Mesquite", "count": 1},
+        {"date": "2026-02-20", "city": "Princeton", "count": 2},
+        {"date": "2026-02-20", "city": "Red Oak", "count": 2},
+        {"date": "2026-02-21", "city": "Mesquite", "count": 1},
+        {"date": "2026-02-21", "city": "Princeton", "count": 1},
+        {"date": "2026-02-21", "city": "Tyler", "count": 2},
+        {"date": "2026-02-22", "city": "Dallas", "count": 2},
+        {"date": "2026-02-22", "city": "Decatur", "count": 1},
+        {"date": "2026-02-22", "city": "Princeton", "count": 1},
+        {"date": "2026-02-23", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-02-23", "city": "Decatur", "count": 1},
+        {"date": "2026-02-23", "city": "Mabank", "count": 2},
+        {"date": "2026-02-23", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-23", "city": "Tyler", "count": 1},
+        {"date": "2026-02-24", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-24", "city": "Mesquite", "count": 1},
+        {"date": "2026-02-24", "city": "Red Oak", "count": 1},
+        {"date": "2026-02-25", "city": "Boyd", "count": 1},
+        {"date": "2026-02-25", "city": "Dallas", "count": 2},
+        {"date": "2026-02-25", "city": "Mabank", "count": 1},
+        {"date": "2026-02-25", "city": "Waxahachie", "count": 2},
+        {"date": "2026-02-26", "city": "Dallas", "count": 1},
+        {"date": "2026-02-26", "city": "Mabank", "count": 1},
+        {"date": "2026-02-26", "city": "Red Oak", "count": 2},
+        {"date": "2026-02-26", "city": "Waxahachie", "count": 2},
+        {"date": "2026-02-27", "city": "Blue Ridge", "count": 1},
+        {"date": "2026-02-27", "city": "Farmersville", "count": 1},
+        {"date": "2026-02-27", "city": "Princeton", "count": 1},
+        {"date": "2026-02-28", "city": "Anna", "count": 2},
+        {"date": "2026-02-28", "city": "Cleveland", "count": 1},
+        {"date": "2026-02-28", "city": "Mabank", "count": 1},
+        {"date": "2026-02-28", "city": "Princeton", "count": 1},
+        {"date": "2026-02-28", "city": "Red Oak", "count": 4},
+        {"date": "2026-02-28", "city": "Tyler", "count": 1},
+        {"date": "2026-03-01", "city": "Dallas", "count": 1},
+        {"date": "2026-03-01", "city": "Mabank", "count": 1},
+        {"date": "2026-03-01", "city": "Tyler", "count": 1},
+        {"date": "2026-03-02", "city": "Dallas", "count": 1},
+        {"date": "2026-03-02", "city": "Mabank", "count": 1},
+        {"date": "2026-03-02", "city": "Princeton", "count": 1},
+        {"date": "2026-03-02", "city": "Red Oak", "count": 2},
+        {"date": "2026-03-02", "city": "Tyler", "count": 1},
+        {"date": "2026-03-03", "city": "Celina", "count": 1},
+        {"date": "2026-03-03", "city": "Decatur", "count": 1},
+        {"date": "2026-03-03", "city": "Princeton", "count": 1},
+        {"date": "2026-03-03", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-03", "city": "Tyler", "count": 1},
+        {"date": "2026-03-04", "city": "Boyd", "count": 1},
+        {"date": "2026-03-04", "city": "Mabank", "count": 2},
+        {"date": "2026-03-04", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-05", "city": "Decatur", "count": 1},
+        {"date": "2026-03-05", "city": "Mabank", "count": 1},
+        {"date": "2026-03-06", "city": "Princeton", "count": 1},
+        {"date": "2026-03-06", "city": "Waxahachie", "count": 1},
+        {"date": "2026-03-07", "city": "Dallas", "count": 1},
+        {"date": "2026-03-07", "city": "Decatur", "count": 1},
+        {"date": "2026-03-07", "city": "Hutchins", "count": 1},
+        {"date": "2026-03-07", "city": "Mabank", "count": 1},
+        {"date": "2026-03-07", "city": "Tyler", "count": 1},
+        {"date": "2026-03-08", "city": "Boyd", "count": 1},
+        {"date": "2026-03-08", "city": "Dallas", "count": 1},
+        {"date": "2026-03-08", "city": "Decatur", "count": 1},
+        {"date": "2026-03-08", "city": "Red Oak", "count": 2},
+        {"date": "2026-03-09", "city": "Boyd", "count": 1},
+        {"date": "2026-03-09", "city": "Mabank", "count": 1},
+        {"date": "2026-03-10", "city": "Dallas", "count": 1},
+        {"date": "2026-03-10", "city": "Mesquite", "count": 1},
+        {"date": "2026-03-10", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-10", "city": "Waxahachie", "count": 2},
+        {"date": "2026-03-11", "city": "Athens", "count": 1},
+        {"date": "2026-03-11", "city": "Mabank", "count": 1},
+        {"date": "2026-03-11", "city": "Mesquite", "count": 1},
+        {"date": "2026-03-11", "city": "Red Oak", "count": 2},
+        {"date": "2026-03-12", "city": "Dallas", "count": 2},
+        {"date": "2026-03-12", "city": "Farmersville", "count": 1},
+        {"date": "2026-03-12", "city": "Princeton", "count": 1},
+        {"date": "2026-03-13", "city": "Decatur", "count": 1},
+        {"date": "2026-03-13", "city": "Tyler", "count": 2},
+        {"date": "2026-03-13", "city": "Waxahachie", "count": 1},
+        {"date": "2026-03-14", "city": "Dallas", "count": 1},
+        {"date": "2026-03-14", "city": "Durant", "count": 1},
+        {"date": "2026-03-14", "city": "Farmersville", "count": 1},
+        {"date": "2026-03-14", "city": "Red Oak", "count": 2},
+        {"date": "2026-03-15", "city": "Dallas", "count": 1},
+        {"date": "2026-03-15", "city": "Durant", "count": 1},
+        {"date": "2026-03-15", "city": "Red Oak", "count": 1},
+        {"date": "2026-03-16", "city": "Dallas", "count": 2},
+        {"date": "2026-03-16", "city": "Mabank", "count": 1},
+        {"date": "2026-03-17", "city": "Boyd", "count": 1},
+        {"date": "2026-03-17", "city": "Hutchins", "count": 1},
+        {"date": "2026-03-17", "city": "Red Oak", "count": 4},
+        {"date": "2026-03-18", "city": "Athens", "count": 1},
+        {"date": "2026-03-18", "city": "Cleveland", "count": 3},
+        {"date": "2026-03-18", "city": "Farmersville", "count": 1},
+        {"date": "2026-03-18", "city": "Red Oak", "count": 1}
+    ]
+
+    opps_owner = [
+        {"date": "2026-01-02", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-01-02", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-02", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-01-02", "owner": "Stephanie", "count": 1},
+        {"date": "2026-01-03", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-03", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-01-03", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-03", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-01-03", "owner": "Michelle", "count": 2},
+        {"date": "2026-01-03", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-04", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-01-05", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-05", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-05", "owner": "Stephanie", "count": 1},
+        {"date": "2026-01-06", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-01-06", "owner": "Shelby", "count": 2},
+        {"date": "2026-01-07", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-01-07", "owner": "Claudia", "count": 1},
+        {"date": "2026-01-07", "owner": "Michelle", "count": 1},
+        {"date": "2026-01-07", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-08", "owner": "Dipna Gomez", "count": 2},
+        {"date": "2026-01-08", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-08", "owner": "Julie", "count": 1},
+        {"date": "2026-01-08", "owner": "Stephanie", "count": 2},
+        {"date": "2026-01-09", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-01-09", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-09", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-10", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-01-10", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-01-11", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-11", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-11", "owner": "Stephanie", "count": 1},
+        {"date": "2026-01-12", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-12", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-01-12", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-12", "owner": "Julie", "count": 1},
+        {"date": "2026-01-12", "owner": "Melissa", "count": 1},
+        {"date": "2026-01-13", "owner": "Carri Youssef", "count": 2},
+        {"date": "2026-01-13", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-01-14", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-01-14", "owner": "Carri Youssef", "count": 2},
+        {"date": "2026-01-14", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-15", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-15", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-01-15", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-15", "owner": "Julie", "count": 1},
+        {"date": "2026-01-15", "owner": "Michelle", "count": 1},
+        {"date": "2026-01-16", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-01-16", "owner": "Melissa", "count": 2},
+        {"date": "2026-01-16", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-17", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-01-17", "owner": "Julie", "count": 2},
+        {"date": "2026-01-17", "owner": "Michelle", "count": 1},
+        {"date": "2026-01-17", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-18", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-01-18", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-18", "owner": "Julie", "count": 1},
+        {"date": "2026-01-19", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-19", "owner": "Lisa Mosley", "count": 1},
+        {"date": "2026-01-20", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-01-20", "owner": "Michelle", "count": 2},
+        {"date": "2026-01-21", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-22", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-22", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-01-22", "owner": "Michelle", "count": 1},
+        {"date": "2026-01-22", "owner": "Shelby", "count": 3},
+        {"date": "2026-01-23", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-01-24", "owner": "Julie", "count": 2},
+        {"date": "2026-01-26", "owner": "Melissa", "count": 1},
+        {"date": "2026-01-27", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-01-27", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-01-27", "owner": "Michelle", "count": 2},
+        {"date": "2026-01-27", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-28", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-01-28", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-01-28", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-29", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-01-29", "owner": "Michelle", "count": 1},
+        {"date": "2026-01-30", "owner": "Julie", "count": 1},
+        {"date": "2026-01-30", "owner": "Melissa", "count": 1},
+        {"date": "2026-01-30", "owner": "Shelby", "count": 1},
+        {"date": "2026-01-31", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-01", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-02-01", "owner": "Julie", "count": 1},
+        {"date": "2026-02-01", "owner": "Michelle", "count": 1},
+        {"date": "2026-02-01", "owner": "Stephanie", "count": 1},
+        {"date": "2026-02-02", "owner": "Julie", "count": 2},
+        {"date": "2026-02-03", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-03", "owner": "Shelby", "count": 1},
+        {"date": "2026-02-04", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-04", "owner": "Stephanie", "count": 1},
+        {"date": "2026-02-05", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-05", "owner": "Claudia", "count": 1},
+        {"date": "2026-02-06", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-06", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-06", "owner": "Julie", "count": 1},
+        {"date": "2026-02-06", "owner": "Mayra", "count": 1},
+        {"date": "2026-02-06", "owner": "Michelle", "count": 1},
+        {"date": "2026-02-07", "owner": "Julie", "count": 3},
+        {"date": "2026-02-07", "owner": "Michelle", "count": 2},
+        {"date": "2026-02-07", "owner": "Shelby", "count": 2},
+        {"date": "2026-02-08", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-08", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-08", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-02-09", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-09", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-09", "owner": "Michelle", "count": 2},
+        {"date": "2026-02-09", "owner": "Shelby", "count": 2},
+        {"date": "2026-02-10", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-10", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-10", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-10", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-10", "owner": "Melissa", "count": 1},
+        {"date": "2026-02-11", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-02-11", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-02-11", "owner": "Julie", "count": 2},
+        {"date": "2026-02-11", "owner": "Mayra", "count": 1},
+        {"date": "2026-02-11", "owner": "Michelle", "count": 1},
+        {"date": "2026-02-11", "owner": "Shelby", "count": 2},
+        {"date": "2026-02-12", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-02-12", "owner": "Julie", "count": 1},
+        {"date": "2026-02-12", "owner": "Mayra", "count": 1},
+        {"date": "2026-02-12", "owner": "Melissa", "count": 1},
+        {"date": "2026-02-12", "owner": "Veronica Estrada", "count": 1},
+        {"date": "2026-02-13", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-14", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-14", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-15", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-16", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-16", "owner": "Veronica Estrada", "count": 3},
+        {"date": "2026-02-17", "owner": "Carri Youssef", "count": 2},
+        {"date": "2026-02-17", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-17", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-17", "owner": "Mayra", "count": 1},
+        {"date": "2026-02-17", "owner": "Michelle", "count": 2},
+        {"date": "2026-02-17", "owner": "Shelby", "count": 1},
+        {"date": "2026-02-17", "owner": "Veronica Estrada", "count": 1},
+        {"date": "2026-02-18", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-02-18", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-18", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-18", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-02-18", "owner": "Mayra", "count": 1},
+        {"date": "2026-02-19", "owner": "Shelby", "count": 1},
+        {"date": "2026-02-19", "owner": "Stephanie", "count": 3},
+        {"date": "2026-02-20", "owner": "Claudia", "count": 1},
+        {"date": "2026-02-20", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-20", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-20", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-02-20", "owner": "Shelby", "count": 2},
+        {"date": "2026-02-20", "owner": "Stephanie", "count": 1},
+        {"date": "2026-02-21", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-21", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-21", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-21", "owner": "Mayra", "count": 1},
+        {"date": "2026-02-22", "owner": "Dipna Gomez", "count": 2},
+        {"date": "2026-02-22", "owner": "Michelle", "count": 1},
+        {"date": "2026-02-22", "owner": "Stephanie", "count": 1},
+        {"date": "2026-02-23", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-23", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-02-23", "owner": "Julie", "count": 1},
+        {"date": "2026-02-23", "owner": "Michelle", "count": 1},
+        {"date": "2026-02-23", "owner": "Stephanie", "count": 1},
+        {"date": "2026-02-24", "owner": "Claudia", "count": 1},
+        {"date": "2026-02-24", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-24", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-25", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-02-25", "owner": "Dipna Gomez", "count": 2},
+        {"date": "2026-02-25", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-25", "owner": "Michelle", "count": 1},
+        {"date": "2026-02-25", "owner": "Shelby", "count": 1},
+        {"date": "2026-02-26", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-02-26", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-26", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-02-26", "owner": "Julie", "count": 2},
+        {"date": "2026-02-26", "owner": "Shelby", "count": 1},
+        {"date": "2026-02-27", "owner": "Mayra", "count": 2},
+        {"date": "2026-02-27", "owner": "Stephanie", "count": 1},
+        {"date": "2026-02-28", "owner": "Carri Youssef", "count": 2},
+        {"date": "2026-02-28", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-02-28", "owner": "Julie", "count": 2},
+        {"date": "2026-02-28", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-02-28", "owner": "Mayra", "count": 2},
+        {"date": "2026-02-28", "owner": "Stephanie", "count": 2},
+        {"date": "2026-03-01", "owner": "Carri Youssef", "count": 2},
+        {"date": "2026-03-01", "owner": "Julie", "count": 1},
+        {"date": "2026-03-02", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-03-02", "owner": "Gina Diaz", "count": 2},
+        {"date": "2026-03-02", "owner": "Julie", "count": 2},
+        {"date": "2026-03-02", "owner": "Melissa", "count": 1},
+        {"date": "2026-03-03", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-03-03", "owner": "Julie", "count": 1},
+        {"date": "2026-03-03", "owner": "Melissa", "count": 2},
+        {"date": "2026-03-03", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-04", "owner": "Carri Youssef", "count": 2},
+        {"date": "2026-03-04", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-03-04", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-05", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-03-05", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-06", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-03-06", "owner": "Stephanie", "count": 1},
+        {"date": "2026-03-07", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-03-07", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-03-07", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-03-07", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-07", "owner": "Shelby", "count": 1},
+        {"date": "2026-03-08", "owner": "Dipna Gomez", "count": 2},
+        {"date": "2026-03-08", "owner": "Julie", "count": 1},
+        {"date": "2026-03-08", "owner": "Michelle", "count": 2},
+        {"date": "2026-03-09", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-03-09", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-10", "owner": "Dipna Gomez", "count": 2},
+        {"date": "2026-03-10", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-03-10", "owner": "Shelby", "count": 1},
+        {"date": "2026-03-11", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-03-11", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-03-11", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-03-11", "owner": "Julie", "count": 1},
+        {"date": "2026-03-11", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-03-12", "owner": "Arieyana Midkiff", "count": 1},
+        {"date": "2026-03-12", "owner": "Julie", "count": 1},
+        {"date": "2026-03-12", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-03-12", "owner": "Veronica Estrada", "count": 1},
+        {"date": "2026-03-13", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-03-13", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-03-13", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-03-13", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-14", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-03-14", "owner": "Mayra", "count": 1},
+        {"date": "2026-03-14", "owner": "Melissa", "count": 1},
+        {"date": "2026-03-14", "owner": "Shelby", "count": 2},
+        {"date": "2026-03-15", "owner": "Magali Diaz", "count": 2},
+        {"date": "2026-03-15", "owner": "Melissa", "count": 1},
+        {"date": "2026-03-16", "owner": "Carri Youssef", "count": 1},
+        {"date": "2026-03-16", "owner": "Dipna Gomez", "count": 1},
+        {"date": "2026-03-16", "owner": "Julie", "count": 1},
+        {"date": "2026-03-17", "owner": "Julie", "count": 4},
+        {"date": "2026-03-17", "owner": "Magali Diaz", "count": 1},
+        {"date": "2026-03-17", "owner": "Michelle", "count": 1},
+        {"date": "2026-03-18", "owner": "Claudia", "count": 2},
+        {"date": "2026-03-18", "owner": "Gina Diaz", "count": 1},
+        {"date": "2026-03-18", "owner": "Julie", "count": 1},
+        {"date": "2026-03-18", "owner": "Mayra", "count": 2}
+    ]
+
+    return leads, cw, lost, opps_owner, opps, [], []   # leads_daily/src empty in cached mode
+
+
+if __name__ == "__main__":
+    main()
