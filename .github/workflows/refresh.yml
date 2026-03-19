@@ -25,13 +25,19 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Generate dashboard (build + run in one step)
+      - name: Restore NuGet packages
+        run: dotnet restore SalesDashboard/SalesDashboard.csproj
+
+      - name: Build dashboard generator
+        run: dotnet build SalesDashboard/SalesDashboard.csproj --configuration Release --no-restore
+
+      - name: Run dashboard generator
         env:
           SF_CLIENT_ID:     ${{ secrets.SF_CLIENT_ID }}
           SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
           SF_USERNAME:      ${{ secrets.SF_USERNAME }}
           SF_PASSWORD:      ${{ secrets.SF_PASSWORD }}
-        run: dotnet run --project SalesDashboard/SalesDashboard.csproj --configuration Release
+        run: dotnet SalesDashboard/bin/Release/net8.0/SalesDashboard.dll
 
       - name: Commit and push updated dashboard
         env:
