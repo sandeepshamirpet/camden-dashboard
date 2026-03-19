@@ -57,84 +57,81 @@ public static class Fetcher
         };
     }
 
-    // ── 1. Daily lead counts grouped by CST date ───────────────────────────
+    // Salesforce aggregate (GROUP BY) queries don't support queryMore() pagination.
+    // Querying year-by-year keeps every batch ≤ 366 rows — well under the 2,000 limit.
+    private static int StartYear => 2019;
+    private static int CurrentYear => TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, CST).Year;
+
+    // ── 1. Daily lead counts grouped by CST date (year by year) ───────────
     private static async Task<List<DailyCount>> FetchLeadsDailyAsync(HttpClient http)
     {
-        const string soql =
-            "SELECT DAY_ONLY(ConvertTimezone(CreatedDate)) d, COUNT(Id) cnt " +
-            "FROM Lead " +
-            "GROUP BY DAY_ONLY(ConvertTimezone(CreatedDate)) " +
-            "ORDER BY DAY_ONLY(ConvertTimezone(CreatedDate)) ASC";
-
-        var records = await QueryAllAsync(http, soql);
-        var result = new List<DailyCount>(records.Count);
-
-        foreach (var r in records)
+        var result = new List<DailyCount>();
+        for (int yr = StartYear; yr <= CurrentYear; yr++)
         {
-            string date = r.TryGetProperty("d", out var d) ? (d.GetString() ?? "") : "";
-            int    cnt  = r.TryGetProperty("cnt", out var c) ? c.GetInt32() : 0;
-            if (!string.IsNullOrEmpty(date))
-                result.Add(new DailyCount(date, cnt));
-        }
+            string soql =
+                $"SELECT DAY_ONLY(ConvertTimezone(CreatedDate)) d, COUNT(Id) cnt " +
+                $"FROM Lead " +
+                $"WHERE CALENDAR_YEAR(ConvertTimezone(CreatedDate)) = {yr} " +
+                $"GROUP BY DAY_ONLY(ConvertTimezone(CreatedDate)) " +
+                $"ORDER BY DAY_ONLY(ConvertTimezone(CreatedDate)) ASC";
 
+            foreach (var r in await QueryBatchAsync(http, soql))
+            {
+                string date = r.TryGetProperty("d",   out var d) ? (d.GetString() ?? "") : "";
+                int    cnt  = r.TryGetProperty("cnt", out var c) ? c.GetInt32() : 0;
+                if (!string.IsNullOrEmpty(date)) result.Add(new DailyCount(date, cnt));
+            }
+        }
         return result;
     }
 
-    // ── 2. Monthly leads by lead source ───────────────────────────────────
+    // ── 2. Monthly leads by lead source (year by year) ────────────────────
     private static async Task<List<MonthlySrc>> FetchLeadsBySourceAsync(HttpClient http)
     {
-        const string soql =
-            "SELECT CALENDAR_YEAR(ConvertTimezone(CreatedDate)) yr, " +
-            "CALENDAR_MONTH(ConvertTimezone(CreatedDate)) mo, " +
-            "LeadSource src, COUNT(Id) cnt " +
-            "FROM Lead " +
-            "GROUP BY CALENDAR_YEAR(ConvertTimezone(CreatedDate)), " +
-            "CALENDAR_MONTH(ConvertTimezone(CreatedDate)), LeadSource " +
-            "ORDER BY CALENDAR_YEAR(ConvertTimezone(CreatedDate)) ASC, " +
-            "CALENDAR_MONTH(ConvertTimezone(CreatedDate)) ASC";
-
-        var records = await QueryAllAsync(http, soql);
-        var result  = new List<MonthlySrc>(records.Count);
-
-        foreach (var r in records)
+        var result = new List<MonthlySrc>();
+        for (int yr = StartYear; yr <= CurrentYear; yr++)
         {
-            int    yr  = r.TryGetProperty("yr",  out var y)   ? y.GetInt32()   : 0;
-            int    mo  = r.TryGetProperty("mo",  out var m)   ? m.GetInt32()   : 0;
-            string src = r.TryGetProperty("src", out var s)   ? (s.GetString() ?? "Unknown") : "Unknown";
-            int    cnt = r.TryGetProperty("cnt", out var c)   ? c.GetInt32()   : 0;
-            if (yr > 0 && mo > 0)
-                result.Add(new MonthlySrc($"{yr}-{mo:D2}", src, cnt));
-        }
+            string soql =
+                $"SELECT CALENDAR_MONTH(ConvertTimezone(CreatedDate)) mo, " +
+                $"LeadSource src, COUNT(Id) cnt " +
+                $"FROM Lead " +
+                $"WHERE CALENDAR_YEAR(ConvertTimezone(CreatedDate)) = {yr} " +
+                $"GROUP BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)), LeadSource " +
+                $"ORDER BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)) ASC";
 
+            foreach (var r in await QueryBatchAsync(http, soql))
+            {
+                int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
+                string src = r.TryGetProperty("src", out var s) ? (s.GetString() ?? "Unknown") : "Unknown";
+                int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
+                if (mo > 0) result.Add(new MonthlySrc($"{yr}-{mo:D2}", src, cnt));
+            }
+        }
         return result;
     }
 
-    // ── 3. Monthly leads by area of interest ──────────────────────────────
+    // ── 3. Monthly leads by area of interest (year by year) ───────────────
     private static async Task<List<MonthlyAoi>> FetchLeadsByAoiAsync(HttpClient http)
     {
-        const string soql =
-            "SELECT CALENDAR_YEAR(ConvertTimezone(CreatedDate)) yr, " +
-            "CALENDAR_MONTH(ConvertTimezone(CreatedDate)) mo, " +
-            "Area_of_Interest__c aoi, COUNT(Id) cnt " +
-            "FROM Lead " +
-            "GROUP BY CALENDAR_YEAR(ConvertTimezone(CreatedDate)), " +
-            "CALENDAR_MONTH(ConvertTimezone(CreatedDate)), Area_of_Interest__c " +
-            "ORDER BY CALENDAR_YEAR(ConvertTimezone(CreatedDate)) ASC, " +
-            "CALENDAR_MONTH(ConvertTimezone(CreatedDate)) ASC";
-
-        var records = await QueryAllAsync(http, soql);
-        var result  = new List<MonthlyAoi>(records.Count);
-
-        foreach (var r in records)
+        var result = new List<MonthlyAoi>();
+        for (int yr = StartYear; yr <= CurrentYear; yr++)
         {
-            int    yr  = r.TryGetProperty("yr",  out var y) ? y.GetInt32()   : 0;
-            int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
-            string aoi = r.TryGetProperty("aoi", out var a) ? (a.GetString() ?? "Unknown") : "Unknown";
-            int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
-            if (yr > 0 && mo > 0)
-                result.Add(new MonthlyAoi($"{yr}-{mo:D2}", string.IsNullOrWhiteSpace(aoi) ? "Unknown" : aoi, cnt));
-        }
+            string soql =
+                $"SELECT CALENDAR_MONTH(ConvertTimezone(CreatedDate)) mo, " +
+                $"Area_of_Interest__c aoi, COUNT(Id) cnt " +
+                $"FROM Lead " +
+                $"WHERE CALENDAR_YEAR(ConvertTimezone(CreatedDate)) = {yr} " +
+                $"GROUP BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)), Area_of_Interest__c " +
+                $"ORDER BY CALENDAR_MONTH(ConvertTimezone(CreatedDate)) ASC";
 
+            foreach (var r in await QueryBatchAsync(http, soql))
+            {
+                int    mo  = r.TryGetProperty("mo",  out var m) ? m.GetInt32()   : 0;
+                string aoi = r.TryGetProperty("aoi", out var a) ? (a.GetString() ?? "Unknown") : "Unknown";
+                int    cnt = r.TryGetProperty("cnt", out var c) ? c.GetInt32()   : 0;
+                if (mo > 0) result.Add(new MonthlyAoi($"{yr}-{mo:D2}", string.IsNullOrWhiteSpace(aoi) ? "Unknown" : aoi, cnt));
+            }
+        }
         return result;
     }
 
@@ -191,6 +188,24 @@ public static class Fetcher
         return TimeZoneInfo.ConvertTimeFromUtc(utc, CST).ToString("yyyy-MM-dd");
     }
 
+    // For aggregate (GROUP BY) queries — single batch only, no queryMore()
+    private static async Task<List<JsonElement>> QueryBatchAsync(HttpClient http, string soql)
+    {
+        string url  = $"{API}?q={Uri.EscapeDataString(soql)}";
+        var resp    = await http.GetAsync(url);
+        var body    = await resp.Content.ReadAsStringAsync();
+
+        if (!resp.IsSuccessStatusCode)
+            throw new Exception($"SOQL failed: {(int)resp.StatusCode}\nSOQL: {soql}\n{body}");
+
+        var json = JsonSerializer.Deserialize<JsonElement>(body);
+        var all  = new List<JsonElement>();
+        foreach (var rec in json.GetProperty("records").EnumerateArray())
+            all.Add(rec);
+        return all;
+    }
+
+    // For regular (non-aggregate) queries — follows nextRecordsUrl pages
     private static async Task<List<JsonElement>> QueryAllAsync(HttpClient http, string soql)
     {
         var all = new List<JsonElement>();
